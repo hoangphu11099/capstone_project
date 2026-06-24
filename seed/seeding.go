@@ -7,6 +7,8 @@ import (
 
 	"student-management/config"
 	"student-management/models"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func SeedData() {
@@ -28,12 +30,14 @@ func SeedData() {
 	// ----------------------
 	// 2. Seed ADMIN
 	// ----------------------
-	db.Create(&models.User{
-		Username: "admin",
-		Password: "123456",
-		Role:     "admin",
-	})
 
+	hash, _ := bcrypt.GenerateFromPassword([]byte("123456"), bcrypt.DefaultCost)
+	db.Create(&models.User{
+		Username:   "admin",
+		Password:   string(hash),
+		Role:       "admin",
+		FirstLogin: true,
+	})
 	// ----------------------
 	// 3. Seed 20 giáo viên
 	// ----------------------
@@ -47,11 +51,13 @@ func SeedData() {
 		db.Create(&t)
 		teachers = append(teachers, t)
 
+		hash, _ := bcrypt.GenerateFromPassword([]byte("123456"), bcrypt.DefaultCost)
 		db.Create(&models.User{
-			Username:  fmt.Sprintf("teacher%d", i),
-			Password:  "123456",
-			Role:      "teacher",
-			TeacherID: &t.ID,
+			Username:   "teacher" + fmt.Sprintf("%02d", i),
+			Password:   string(hash),
+			Role:       "teacher",
+			TeacherID:  &t.ID,
+			FirstLogin: true,
 		})
 	}
 
@@ -80,11 +86,13 @@ func SeedData() {
 				}
 				db.Create(&student)
 
+				hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("123456"), bcrypt.DefaultCost)
 				db.Create(&models.User{
-					Username:  fmt.Sprintf("%s_user%03d%02d", khoa, i, j),
-					Password:  "123456",
-					Role:      "student",
-					StudentID: &student.ID,
+					Username:   fmt.Sprintf("%s_user%03d%02d", khoa, i, j),
+					Password:   string(hashedPassword),
+					Role:       "student",
+					StudentID:  &student.ID,
+					FirstLogin: true,
 				})
 			}
 		}

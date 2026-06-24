@@ -23,6 +23,7 @@ type ForgotPasswordRequest struct {
 	Username string `json:"username"`
 }
 
+// func login
 func Login(c *gin.Context) {
 	var input LoginRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -59,9 +60,8 @@ func Login(c *gin.Context) {
 	})
 }
 
-// ----------------------
-// Change Password
-// ----------------------
+//func Change Password
+
 func ChangePassword(c *gin.Context) {
 	var req ChangePasswordRequest
 	userID := c.GetUint("userID")
