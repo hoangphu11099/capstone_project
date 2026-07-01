@@ -1,11 +1,15 @@
 package models
 
-import "gorm.io/gorm"
-
 type Course struct {
-	gorm.Model
-	CourseCode string `gorm:"type:varchar(100);charset:utf8mb4"`
-	CourseName string `gorm:"type:varchar(255);charset:utf8mb4"`
+	ID         uint   `gorm:"primaryKey"`
+	Code       string `gorm:"unique;not null"`
+	Name       string `gorm:"not null"`
 	Credits    int
-	TeacherID  uint
+	MajorID    uint
+	Major      Major `gorm:"foreignKey:MajorID"`
+	SemesterID uint
+	Semester   Semester `gorm:"foreignKey:SemesterID"`
+	IsActive   bool     `gorm:"default:true"`
+
+	Enrollments []Enrollment
 }

@@ -1,12 +1,20 @@
 package models
 
-import "gorm.io/gorm"
+import "time"
 
 type Student struct {
-	gorm.Model
-	StudentCode string
-	FullName    string
-	BirthDate   string
-	Gender      string
-	ClassID     uint
+	ID             uint   `gorm:"primaryKey"`
+	StudentCode    string `gorm:"unique;not null"`
+	UserID         uint   `gorm:"unique;not null"`
+	User           User   `gorm:"foreignKey:UserID"`
+	ClassID        uint
+	Class          Class `gorm:"foreignKey:ClassID"`
+	DateOfBirth    time.Time
+	Gender         string
+	Phone          string
+	Address        string
+	EnrollmentDate time.Time
+	Status         string `gorm:"default:active"`
+
+	Enrollments []Enrollment
 }

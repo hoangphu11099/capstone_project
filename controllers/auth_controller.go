@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"net/http"
+
 	"student-management/config"
 	"student-management/models"
 	"student-management/utils"
@@ -11,103 +12,196 @@ import (
 )
 
 type LoginRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
 }
 
 type ChangePasswordRequest struct {
-	NewPassword string `json:"new_password"`
+	NewPassword string `json:"new_password" binding:"required"`
 }
 
 type ForgotPasswordRequest struct {
-	Username string `json:"username"`
+	Username string `json:"username" binding:"required"`
 }
 
-// func login
 func Login(c *gin.Context) {
 	var input LoginRequest
+
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Username and password are required",
+		})
 		return
 	}
 
 	var user models.User
-	config.DB.Where("username = ?", input.Username).First(&user)
-	if user.ID == 0 {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
+	if err := config.DB.Preload("Role").
+		Where("username = ?", input.Username).
+		First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "User not found",
+		})
 		return
 	}
 
 	err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password))
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Wrong password"})
-		return
-	}
-
-	// Nếu lần đầu login thì yeu cầu đổi mật khẩu
-	if user.FirstLogin {
-		c.JSON(http.StatusOK, gin.H{
-			"message":     "First login, please change password",
-			"first_login": true,
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Wrong password",
 		})
 		return
 	}
 
-	token, _ := utils.GenerateToken(user.ID, user.Role)
+	token, err := utils.GenerateToken(user.ID, user.Role.Name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Cannot generate token",
+		})
+		return
+	}
+
+	if user.FirstLogin {
+		c.JSON(http.StatusOK, gin.H{
+			"message":     "First login, please change password",
+			"token":       token,
+			"first_login": true,
+			"user": gin.H{
+				"id":       user.ID,
+				"username": user.Username,
+				"fullName": user.FullName,
+				"role":     user.Role.Name,
+			},
+		})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
+		"message":     "Login successfully",
 		"token":       token,
+		"first_login": false,
+		"user": gin.H{
+			"id":       user.ID,
+			"username": user.Username,
+			"fullName": user.FullName,
+			"role":     user.Role.Name,
+		},
+	})
+}
+
+func ChangePassword(c *gin.Context) {
+	var req ChangePasswordRequest
+
+	userIDValue, exists := c.Get("userID")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Unauthorized",
+		})
+		return
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "New password is required",
+		})
+		return
+	}
+
+	if len(req.NewPassword) < 6 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "New password must be at least 6 characters",
+		})
+		return
+	}
+
+	var userID uint
+
+	switch v := userIDValue.(type) {
+	case uint:
+		userID = v
+	case float64:
+		userID = uint(v)
+	case int:
+		userID = uint(v)
+	default:
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid user ID in token",
+		})
+		return
+	}
+
+	var user models.User
+	if err := config.DB.First(&user, userID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "User not found",
+		})
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Cannot hash password",
+		})
+		return
+	}
+
+	user.Password = string(hash)
+	user.FirstLogin = false
+
+	if err := config.DB.Save(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Cannot update password",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Password changed successfully",
 		"first_login": false,
 	})
 }
 
-//func Change Password
-
-func ChangePassword(c *gin.Context) {
-	var req ChangePasswordRequest
-	userID := c.GetUint("userID")
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	var user models.User
-	config.DB.First(&user, userID)
-
-	hash, _ := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
-	user.Password = string(hash)
-	user.FirstLogin = false
-	config.DB.Save(&user)
-
-	c.JSON(http.StatusOK, gin.H{"message": "Password changed successfully"})
-}
-
-// ----------------------
-// Forgot Password
-// ----------------------
 func ForgotPassword(c *gin.Context) {
 	var req ForgotPasswordRequest
+
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Username is required",
+		})
 		return
 	}
 
 	var user models.User
-	config.DB.Where("username = ?", req.Username).First(&user)
-	if user.ID == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+	if err := config.DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "User not found",
+		})
 		return
 	}
 
-	// Tạo mật khẩu tạm
 	tempPass := "Temp1234"
-	hash, _ := bcrypt.GenerateFromPassword([]byte(tempPass), bcrypt.DefaultCost)
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(tempPass), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Cannot hash temporary password",
+		})
+		return
+	}
+
 	user.Password = string(hash)
 	user.FirstLogin = true
-	config.DB.Save(&user)
+
+	if err := config.DB.Save(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Cannot reset password",
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":       "Temporary password set. User must change password on first login.",
 		"temp_password": tempPass,
+		"first_login":   true,
 	})
 }

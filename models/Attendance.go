@@ -1,12 +1,14 @@
 package models
 
-type Grade struct {
+import "time"
+
+type Attendance struct {
 	ID uint `gorm:"primaryKey"`
 
 	EnrollmentID uint
 	Enrollment   Enrollment `gorm:"foreignKey:EnrollmentID"`
 
-	Score       float64
-	LetterGrade string
-	Remark      string
+	ClassDate time.Time
+	Status    string
+	Note      string
 }

@@ -23,10 +23,12 @@ func main() {
 
 	r.POST("/login", controllers.Login)
 	r.POST("/forgot-password", controllers.ForgotPassword)
-	r.POST("/change-password",
-		middleware.AuthRequired(),
-		controllers.ChangePassword,
-	)
+
+	auth := r.Group("/")
+	auth.Use(middleware.AuthRequired())
+	{
+		auth.POST("/change-password", controllers.ChangePassword)
+	}
 	log.Println("Server running at http://localhost:8080")
 	r.Run(":8080")
 }
