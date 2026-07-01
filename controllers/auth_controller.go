@@ -256,3 +256,10 @@ func ForgotPassword(c *gin.Context) {
 // 		"data":    result,
 // 	})
 // }
+
+func Logout(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Đăng xuất thành công",
+	})
+}
