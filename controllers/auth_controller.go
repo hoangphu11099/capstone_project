@@ -206,6 +206,13 @@ func ForgotPassword(c *gin.Context) {
 	})
 }
 
+func Logout(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Đăng xuất thành công",
+	})
+}
+
 // // Lấy bảng điểm môn học của sinh viên
 // func GetStudentTranscript(c *gin.Context) {
 // 	studentID := c.Param("studentId")
@@ -256,10 +263,3 @@ func ForgotPassword(c *gin.Context) {
 // 		"data":    result,
 // 	})
 // }
-
-func Logout(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Đăng xuất thành công",
-	})
-}
