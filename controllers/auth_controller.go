@@ -205,3 +205,54 @@ func ForgotPassword(c *gin.Context) {
 		"first_login":   true,
 	})
 }
+
+// // Lấy bảng điểm môn học của sinh viên
+// func GetStudentTranscript(c *gin.Context) {
+// 	studentID := c.Param("studentId")
+
+// 	var student models.Student
+
+// 	// Lấy sinh viên cùng danh sách môn học và điểm
+// 	err := config.DB.
+// 		Preload("Enrollments.Course").
+// 		Preload("Enrollments.Grade").
+// 		First(&student, studentID).Error
+
+// 	if err != nil {
+// 		c.JSON(http.StatusNotFound, gin.H{
+// 			"message": "Không tìm thấy sinh viên",
+// 		})
+// 		return
+// 	}
+
+// 	// Khởi tạo dữ liệu bảng điểm trả về
+// 	result := responses.TranscriptResponse{
+// 		StudentID:   student.ID,
+// 		StudentCode: student.StudentCode,
+// 		StudentName: student.FullName,
+// 		Courses:     []responses.TranscriptItem{},
+// 	}
+
+// 	// Duyệt các môn sinh viên đã đăng ký
+// 	for _, enrollment := range student.Enrollments {
+// 		item := responses.TranscriptItem{
+// 			CourseCode: enrollment.Course.Code,
+// 			CourseName: enrollment.Course.Name,
+// 			Credits:    enrollment.Course.Credits,
+
+// 			AssignmentScore: enrollment.Grade.AssignmentScore,
+// 			MidtermScore:    enrollment.Grade.MidtermScore,
+// 			FinalScore:      enrollment.Grade.FinalScore,
+
+// 			TotalScore:  enrollment.Grade.TotalScore,
+// 			GradeLetter: enrollment.Grade.GradeLetter,
+// 		}
+
+// 		result.Courses = append(result.Courses, item)
+// 	}
+
+// 	c.JSON(http.StatusOK, gin.H{
+// 		"message": "Lấy bảng điểm thành công",
+// 		"data":    result,
+// 	})
+// }
