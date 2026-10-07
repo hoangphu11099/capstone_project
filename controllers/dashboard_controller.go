@@ -75,7 +75,7 @@ func dashboardStudent(c *gin.Context) {
 	config.DB.Model(&models.Enrollment{}).Where("student_id = ? AND status <> ?", student.ID, "cancelled").Count(&enrolledCourses)
 	config.DB.Model(&models.Exercise{}).
 		Joins("JOIN enrollments ON (enrollments.course_offering_id = exercises.course_offering_id OR (exercises.course_offering_id IS NULL AND enrollments.class_id = exercises.class_id))").
-		Where("enrollments.student_id = ? AND enrollments.status <> ? AND exercises.status = ?", student.ID, "cancelled", "open").Distinct("exercises.id").Count(&exercises)
+		Where("enrollments.student_id = ? AND enrollments.status <> ? AND exercises.status = ? AND exercises.due_date > ?", student.ID, "cancelled", "open", attendanceNow()).Distinct("exercises.id").Count(&exercises)
 	config.DB.Model(&models.Submission{}).Where("student_id = ?", student.ID).Count(&submissions)
 	config.DB.Model(&models.Attendance{}).
 		Joins("JOIN enrollments ON enrollments.id = attendances.enrollment_id").

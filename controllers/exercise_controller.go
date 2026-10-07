@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type ExerciseRequest struct {
@@ -29,8 +30,9 @@ type SubmissionRequest struct {
 }
 
 type GradeSubmissionRequest struct {
-	Score    float64 `json:"score"`
-	Feedback string  `json:"feedback"`
+	Score       *float64 `json:"score" binding:"required"`
+	SubmittedAt string   `json:"submittedAt"`
+	Feedback    string   `json:"feedback"`
 }
 
 func CreateExercise(c *gin.Context) {
@@ -60,12 +62,16 @@ func CreateExercise(c *gin.Context) {
 	}
 	req.ClassID = offering.ClassID
 
-	dueDate, err := parseDateTime(req.DueDate)
+	dueDate, err := parseExerciseDeadline(req.DueDate)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Hạn nộp không hợp lệ. Dùng dạng 2026-07-10 23:59 hoặc RFC3339"})
 		return
 	}
 
+	if strings.TrimSpace(req.Title) == "" || !dueDate.After(attendanceNow()) {
+		c.JSON(400, gin.H{"message": "Tiêu đề không được để trống và hạn nộp phải ở tương lai"})
+		return
+	}
 	exercise := models.Exercise{
 		CourseOfferingID: &offering.ID,
 		ClassID:          req.ClassID,
@@ -161,57 +167,38 @@ func SubmitExercise(c *gin.Context) {
 		return
 	}
 
-	var exercise models.Exercise
-	if err := config.DB.First(&exercise, exerciseID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"message": "Không tìm thấy bài tập"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi lấy bài tập", "error": err.Error()})
-		return
-	}
-
-	var count int64
-	if err := config.DB.Model(&models.Enrollment{}).
-		Where("student_id = ? AND class_id = ? AND status <> ?", student.ID, exercise.ClassID, "cancelled").
-		Where("(? IS NULL OR course_offering_id = ?)", exercise.CourseOfferingID, exercise.CourseOfferingID).
-		Count(&count).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi kiểm tra lớp học phần", "error": err.Error()})
-		return
-	}
-
-	if count == 0 {
-		c.JSON(http.StatusForbidden, gin.H{"message": "Sinh viên không thuộc lớp học phần của bài tập này"})
-		return
-	}
-
-	status := "submitted"
-	if !exercise.DueDate.IsZero() && time.Now().After(exercise.DueDate) {
-		status = "late"
-	}
-
 	var submission models.Submission
-	err = config.DB.Where("exercise_id = ? AND student_id = ?", exercise.ID, student.ID).First(&submission).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi kiểm tra bài nộp", "error": err.Error()})
-		return
-	}
-
-	submission.ExerciseID = exercise.ID
-	submission.StudentID = student.ID
-	submission.Content = strings.TrimSpace(req.Content)
-	submission.FileURL = strings.TrimSpace(req.FileURL)
-	submission.SubmittedAt = time.Now()
-	submission.Status = status
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		err = config.DB.Create(&submission).Error
-	} else {
-		err = config.DB.Save(&submission).Error
-	}
-
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		var exercise models.Exercise
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&exercise, exerciseID).Error; err != nil {
+			return err
+		}
+		var count int64
+		if err := tx.Model(&models.Enrollment{}).Where("student_id = ? AND class_id = ? AND status <> ?", student.ID, exercise.ClassID, "cancelled").Where("(? IS NULL OR course_offering_id = ?)", exercise.CourseOfferingID, exercise.CourseOfferingID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return errExerciseForbidden
+		}
+		if !exerciseAcceptsSubmission(exercise, attendanceNow()) {
+			return errExerciseLocked
+		}
+		lookup := tx.Where("exercise_id = ? AND student_id = ?", exercise.ID, student.ID).First(&submission).Error
+		if lookup != nil && !errors.Is(lookup, gorm.ErrRecordNotFound) {
+			return lookup
+		}
+		submission.Score = nil
+		submission.ExerciseID = exercise.ID
+		submission.StudentID = student.ID
+		submission.Content = strings.TrimSpace(req.Content)
+		submission.FileURL = strings.TrimSpace(req.FileURL)
+		submission.SubmittedAt = attendanceNow()
+		submission.Status = "submitted"
+		submission.Feedback = ""
+		return tx.Save(&submission).Error
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Nộp bài thất bại", "error": err.Error()})
+		exerciseActionError(c, err)
 		return
 	}
 
@@ -288,28 +275,121 @@ func GradeSubmission(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Dữ liệu chấm bài không hợp lệ", "error": err.Error()})
 		return
 	}
-	if req.Score < 0 || req.Score > 100 {
+	if *req.Score < 0 || *req.Score > 100 {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Điểm bài tập phải nằm trong khoảng 0 đến 100"})
 		return
 	}
 
 	var submission models.Submission
-	if err := config.DB.Preload("Exercise").Preload("Student.User").First(&submission, submissionID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"message": "Không tìm thấy bài nộp"})
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.First(&submission, submissionID).Error; err != nil {
+			return err
+		}
+		var exercise models.Exercise
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&exercise, submission.ExerciseID).Error; err != nil {
+			return err
+		}
+		if exercise.TeacherID != teacher.ID {
+			return errExerciseForbidden
+		}
+		if err := tx.First(&submission, submissionID).Error; err != nil {
+			return err
+		}
+		if req.SubmittedAt != "" {
+			revision, err := time.Parse(time.RFC3339Nano, req.SubmittedAt)
+			if err != nil || !revision.Equal(submission.SubmittedAt) {
+				return errors.New("Sinh viên vừa nộp lại bài. Hãy tải lại bài nộp trước khi chấm")
+			}
+		}
+		// Update only grading fields; never write an old copy over a student's content.
+		score := *req.Score
+		return tx.Model(&models.Submission{}).Where("id = ?", submission.ID).Updates(map[string]interface{}{"score": score, "feedback": strings.TrimSpace(req.Feedback), "status": "graded"}).Error
+	})
+	if err != nil {
+		exerciseActionError(c, err)
 		return
 	}
-	if submission.Exercise.TeacherID != teacher.ID {
-		c.JSON(http.StatusForbidden, gin.H{"message": "Giảng viên không được chấm bài nộp này"})
-		return
-	}
-
-	score := req.Score
-	submission.Score = &score
-	submission.Feedback = strings.TrimSpace(req.Feedback)
-	if err := config.DB.Save(&submission).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Chấm bài thất bại", "error": err.Error()})
-		return
-	}
+	config.DB.First(&submission, submissionID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Đã lưu điểm bài nộp", "data": submission})
+}
+
+var errExerciseForbidden = errors.New("Bạn không có quyền thực hiện thao tác với bài tập này")
+var errExerciseLocked = errors.New("Bài tập đã khóa hoặc hết hạn nộp. Cần giảng viên mở lại với hạn nộp mới")
+
+func exerciseAcceptsSubmission(exercise models.Exercise, now time.Time) bool {
+	return exercise.Status == "open" && !exercise.DueDate.IsZero() && now.Before(exercise.DueDate)
+}
+
+// Unzoned input is school local time, independent of the server timezone.
+func parseExerciseDeadline(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if date, err := time.Parse(time.RFC3339, value); err == nil {
+		return date, nil
+	}
+	for _, layout := range []string{"2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if date, err := time.ParseInLocation(layout, value, attendanceLocation()); err == nil {
+			return date, nil
+		}
+	}
+	return time.Time{}, errors.New("Hạn nộp không hợp lệ")
+}
+
+type ExerciseAvailabilityRequest struct {
+	Status  string `json:"status"`
+	DueDate string `json:"dueDate"`
+}
+
+func UpdateExerciseAvailability(c *gin.Context) {
+	teacher, ok := getCurrentTeacher(c)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(400, gin.H{"message": "ID bài tập không hợp lệ"})
+		return
+	}
+	var req ExerciseAvailabilityRequest
+	if c.ShouldBindJSON(&req) != nil || (req.Status != "open" && req.Status != "closed") {
+		c.JSON(400, gin.H{"message": "Trạng thái phải là open hoặc closed"})
+		return
+	}
+	var exercise models.Exercise
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&exercise, id).Error; err != nil {
+			return err
+		}
+		if exercise.TeacherID != teacher.ID {
+			return errExerciseForbidden
+		}
+		if req.Status == "open" {
+			deadline, err := parseExerciseDeadline(req.DueDate)
+			if err != nil || !deadline.After(attendanceNow()) {
+				return errors.New("Chọn hạn nộp mới ở tương lai để mở lại bài tập")
+			}
+			exercise.DueDate = deadline
+		}
+		exercise.Status = req.Status
+		return tx.Model(&models.Exercise{}).Where("id = ?", id).Updates(map[string]interface{}{"status": exercise.Status, "due_date": exercise.DueDate}).Error
+	})
+	if err != nil {
+		exerciseActionError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"message": "Đã cập nhật thời gian nhận bài", "data": exercise})
+}
+
+func exerciseActionError(c *gin.Context, err error) {
+	status := http.StatusBadRequest
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		status = http.StatusNotFound
+	}
+	if errors.Is(err, errExerciseForbidden) {
+		status = http.StatusForbidden
+	}
+	if errors.Is(err, errExerciseLocked) {
+		status = http.StatusConflict
+	}
+	c.JSON(status, gin.H{"message": err.Error()})
 }

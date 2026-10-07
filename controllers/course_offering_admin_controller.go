@@ -49,6 +49,11 @@ func AssignCourseOffering(c *gin.Context) {
 		return
 	}
 
+	if err := validateFutureTeachingDates(candidates, attendanceNow()); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+
 	classID := uint(classID64)
 	var savedOffering models.CourseOffering
 	err = config.DB.Transaction(func(tx *gorm.DB) error {
@@ -330,4 +335,15 @@ func assignmentSchedules(req AssignCourseOfferingRequest) ([]models.Schedule, er
 		schedules = append(schedules, candidate)
 	}
 	return schedules, nil
+}
+
+// Compare calendar dates in the school's timezone, allowing any lesson today.
+func validateFutureTeachingDates(schedules []models.Schedule, now time.Time) error {
+	today := now.In(attendanceLocation()).Format("2006-01-02")
+	for _, schedule := range schedules {
+		if schedule.FullDate != nil && schedule.FullDate.Format("2006-01-02") < today {
+			return errors.New("không được tạo hoặc sửa lịch dạy vào ngày trong quá khứ")
+		}
+	}
+	return nil
 }

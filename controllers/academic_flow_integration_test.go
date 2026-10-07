@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/joho/godotenv"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -177,9 +178,19 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	}
 	clock := func(m int) string { return fmt.Sprintf("%02d:%02d", m/60, m%60) }
 	req := AssignCourseOfferingRequest{SemesterID: previous.ID, CourseID: course.ID, TeacherID: teacher.ID, RoomID: room.ID, TeachingDates: []string{day(now.AddDate(0, 0, -20))}, StartTime: clock(startMinutes), EndTime: clock(endMinutes)}
-	payload = call(AssignCourseOffering, adminUser.ID, fmt.Sprint(class.ID), req, 200)
-	var oldOffering models.CourseOffering
-	json.Unmarshal(payload["data"], &oldOffering)
+	call(AssignCourseOffering, adminUser.ID, fmt.Sprint(class.ID), req, 400)
+	// Historical records predate the new scheduling policy.
+	oldOffering := models.CourseOffering{ClassID: class.ID, CourseID: course.ID, TeacherID: teacher.ID, RoomID: room.ID, SemesterID: previous.ID, Status: "open"}
+	create(&oldOffering)
+	historical, _ := assignmentSchedules(req)
+	for _, lesson := range historical {
+		lesson.ClassID = class.ID
+		lesson.CourseOfferingID = &oldOffering.ID
+		create(&lesson)
+	}
+	if err := ensureEnrollment(db, student.ID, oldOffering); err != nil {
+		t.Fatal(err)
+	}
 	req.SemesterID = term.ID
 	req.TeacherID = teacher2.ID
 	req.TeachingDates = []string{day(now), day(now.AddDate(0, 0, 7))}
@@ -250,7 +261,44 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	payload = call(SubmitExercise, su.ID, fmt.Sprint(exercise.ID), SubmissionRequest{Content: "My answer"}, 200)
 	var submission models.Submission
 	json.Unmarshal(payload["data"], &submission)
-	call(GradeSubmission, tu2.ID, fmt.Sprint(submission.ID), GradeSubmissionRequest{Score: 85, Feedback: "Good"}, 200)
+	call(GradeSubmission, tu2.ID, fmt.Sprint(submission.ID), map[string]interface{}{"score": 85, "feedback": "Good"}, 200)
+	call(ListStudentExercises, su.ID, "", nil, 200)
+	call(ListExerciseSubmissions, tu2.ID, fmt.Sprint(exercise.ID), nil, 200)
+	call(ListExerciseSubmissions, tu.ID, fmt.Sprint(exercise.ID), nil, 403)
+	call(GradeSubmission, tu.ID, fmt.Sprint(submission.ID), map[string]interface{}{"score": 90}, 403)
+	call(GradeSubmission, tu2.ID, fmt.Sprint(submission.ID), map[string]interface{}{"feedback": "missing score"}, 400)
+	call(GradeSubmission, tu2.ID, fmt.Sprint(submission.ID), map[string]interface{}{"score": 101}, 400)
+	call(UpdateExerciseAvailability, tu.ID, fmt.Sprint(exercise.ID), ExerciseAvailabilityRequest{Status: "closed"}, 403)
+	call(UpdateExerciseAvailability, tu2.ID, fmt.Sprint(exercise.ID), ExerciseAvailabilityRequest{Status: "closed"}, 200)
+	call(SubmitExercise, su.ID, fmt.Sprint(exercise.ID), SubmissionRequest{Content: "blocked"}, 409)
+	call(UpdateExerciseAvailability, tu2.ID, fmt.Sprint(exercise.ID), ExerciseAvailabilityRequest{Status: "open", DueDate: day(now.AddDate(0, 0, -1))}, 400)
+	call(UpdateExerciseAvailability, tu2.ID, fmt.Sprint(exercise.ID), ExerciseAvailabilityRequest{Status: "open", DueDate: now.Add(2 * time.Hour).Format(time.RFC3339)}, 200)
+	call(SubmitExercise, su.ID, fmt.Sprint(exercise.ID), SubmissionRequest{Content: "Revised answer", FileURL: "https://example.test/answer.pdf"}, 200)
+	var revised models.Submission
+	db.First(&revised, submission.ID)
+	if revised.Score != nil || revised.Feedback != "" || revised.Status != "submitted" || revised.Content != "Revised answer" {
+		t.Fatal("resubmission retained stale grade or lost content")
+	}
+	var submissionCount int64
+	db.Model(&models.Submission{}).Where("exercise_id = ? AND student_id = ?", exercise.ID, student.ID).Count(&submissionCount)
+	if submissionCount != 1 {
+		t.Fatal("resubmission duplicated rows")
+	}
+	call(GradeSubmission, tu2.ID, fmt.Sprint(submission.ID), map[string]interface{}{"score": 0, "submittedAt": now.Add(-time.Hour).Format(time.RFC3339)}, 400)
+	call(GradeSubmission, tu2.ID, fmt.Sprint(submission.ID), map[string]interface{}{"score": 0, "feedback": "Please revise"}, 200)
+	db.First(&revised, submission.ID)
+	if revised.Score == nil || *revised.Score != 0 || revised.Status != "graded" {
+		t.Fatal("zero grade was not persisted")
+	}
+	call(ListMySubmissions, su.ID, "", nil, 200)
+	db.Model(&models.Exercise{}).Where("id = ?", exercise.ID).Update("due_date", now.Add(-time.Minute))
+	call(SubmitExercise, su.ID, fmt.Sprint(exercise.ID), SubmissionRequest{Content: "late overwrite"}, 409)
+	db.First(&revised, submission.ID)
+	if revised.Content != "Revised answer" || revised.Score == nil {
+		t.Fatal("late submission changed saved answer")
+	}
+	call(CreateExercise, tu2.ID, "", ExerciseRequest{CourseOfferingID: offering.ID, Title: "Past deadline", DueDate: day(now.AddDate(0, 0, -1))}, 400)
+
 	su2 := user("student2", studentRole.ID)
 	student2 := models.Student{UserID: su2.ID, StudentCode: "S2", ClassID: class.ID, DateOfBirth: now.AddDate(-20, 0, 0), EnrollmentDate: now}
 	create(&student2)
@@ -280,8 +328,8 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		OpenExercises int `json:"openExercises"`
 	}
 	json.Unmarshal(payload["data"], &studentDashboard)
-	if studentDashboard.OpenExercises != 1 {
-		t.Fatal("student dashboard counted the same exercise more than once")
+	if studentDashboard.OpenExercises != 0 {
+		t.Fatal("student dashboard counted an expired exercise as open")
 	}
 	var cancelled models.Enrollment
 	db.Where("student_id = ? AND course_offering_id = ?", student2.ID, offering.ID).First(&cancelled)
@@ -338,6 +386,86 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	}
 
 	call(CreateStudent, adminUser.ID, "", CreateStudentRequest{Username: "created-student", FullName: "Created Student", Email: "created-student@example.test", ClassID: class.ID}, 201)
+	var editable models.Student
+	db.Preload("User").Where("student_code <> ?", "").Joins("JOIN users ON users.id = students.user_id").Where("users.username = ?", "created-student").First(&editable)
+	update := CreateStudentRequest{Username: "created-student", FullName: "Updated Student", Email: "created-student@example.test", ClassID: class.ID, Phone: "0123456789"}
+	call(UpdateStudent, adminUser.ID, fmt.Sprint(editable.ID), update, 200)
+	var updated models.Student
+	db.Preload("User").First(&updated, editable.ID)
+	if updated.User.FullName != update.FullName || updated.Phone != update.Phone || updated.User.Password != editable.User.Password {
+		t.Fatal("student update lost fields or changed password")
+	}
+	update.Username = adminUser.Username
+	call(UpdateStudent, adminUser.ID, fmt.Sprint(editable.ID), update, 400)
+	call(DeleteStudent, adminUser.ID, fmt.Sprint(editable.ID), nil, 400)
+	emptyClass := models.Class{ClassCode: "EMPTY_TEST", MajorID: major.ID, Status: "open", MaxStudents: 10}
+	create(&emptyClass)
+	payload = call(CreateStudent, adminUser.ID, "", CreateStudentRequest{Username: "deletable-student", FullName: "Delete me", Email: "delete@example.test", ClassID: emptyClass.ID}, 201)
+	var deletable models.Student
+	json.Unmarshal(payload["data"], &deletable)
+	call(DeleteStudent, adminUser.ID, fmt.Sprint(deletable.ID), nil, 200)
+	var remaining int64
+	db.Model(&models.User{}).Where("id = ?", deletable.UserID).Count(&remaining)
+	if remaining != 0 {
+		t.Fatal("deleted student can still log in")
+	}
+	call(DeleteStudent, adminUser.ID, fmt.Sprint(deletable.ID), nil, 404)
+
+	var beforeTeacherUpdate models.User
+	db.First(&beforeTeacherUpdate, generated.UserID)
+	teacherUpdate := CreateTeacherRequest{Username: "created-teacher", FullName: "Updated Teacher", Email: "created-teacher@example.test", Phone: "0123456789", Qualification: "Doctor", TeacherCode: "SHOULD_NOT_CHANGE"}
+	call(UpdateTeacher, adminUser.ID, fmt.Sprint(generated.ID), teacherUpdate, 200)
+	var editedTeacher models.Teacher
+	db.Preload("User").First(&editedTeacher, generated.ID)
+	if editedTeacher.TeacherCode != generated.TeacherCode || editedTeacher.Qualification != "Doctor" || editedTeacher.User.FullName != "Updated Teacher" || editedTeacher.User.Password != beforeTeacherUpdate.Password {
+		t.Fatal("teacher update changed code/password or failed to save profile")
+	}
+	teacherUpdate.Username = adminUser.Username
+	teacherUpdate.Qualification = "Should roll back"
+	call(UpdateTeacher, adminUser.ID, fmt.Sprint(generated.ID), teacherUpdate, 400)
+	db.Preload("User").First(&editedTeacher, generated.ID)
+	if editedTeacher.Qualification != "Doctor" {
+		t.Fatal("failed teacher update was not atomic")
+	}
+	teacherUpdate.Username = "created-teacher"
+	teacherUpdate.Password = "Updated@123"
+	call(UpdateTeacher, adminUser.ID, fmt.Sprint(generated.ID), teacherUpdate, 200)
+	db.Preload("User").First(&editedTeacher, generated.ID)
+	if bcrypt.CompareHashAndPassword([]byte(editedTeacher.User.Password), []byte(teacherUpdate.Password)) != nil {
+		t.Fatal("new teacher password not saved")
+	}
+	call(UpdateTeacher, adminUser.ID, "0", teacherUpdate, 400)
+	call(UpdateTeacher, adminUser.ID, "99999999", teacherUpdate, 404)
+
+	payload = call(SaveRoom, adminUser.ID, "", RoomRequest{Name: " A999 ", Building: "New building", Capacity: 40, Description: "Lab"}, 201)
+	var newRoom models.Room
+	json.Unmarshal(payload["data"], &newRoom)
+	if newRoom.Name != "A999" || !newRoom.IsActive {
+		t.Fatal("new room not active or trimmed")
+	}
+	call(SaveRoom, adminUser.ID, "", RoomRequest{Name: "A999", Capacity: 30}, 400)
+	call(SaveRoom, adminUser.ID, "", RoomRequest{Name: "Invalid", Capacity: -1}, 400)
+	call(SaveRoom, adminUser.ID, "", RoomRequest{Name: "   ", Capacity: 30}, 400)
+	call(SaveRoom, adminUser.ID, fmt.Sprint(newRoom.ID), RoomRequest{Name: "A998", Building: "", Capacity: 45, Description: ""}, 200)
+	db.First(&newRoom, newRoom.ID)
+	if newRoom.Name != "A998" || newRoom.Building != "" || newRoom.Description != "" || newRoom.Capacity != 45 {
+		t.Fatal("room update failed")
+	}
+	call(ListRooms, adminUser.ID, "", nil, 200)
+	payload = call(GetMetadata, adminUser.ID, "", nil, 200)
+	var roomMetadata struct {
+		Rooms []models.Room `json:"rooms"`
+	}
+	json.Unmarshal(payload["data"], &roomMetadata)
+	foundRoom := false
+	for _, item := range roomMetadata.Rooms {
+		if item.ID == newRoom.ID {
+			foundRoom = true
+		}
+	}
+	if !foundRoom {
+		t.Fatal("created room missing from scheduling metadata")
+	}
 	call(SaveSemester, adminUser.ID, fmt.Sprint(term.ID), PeriodRequest{Name: term.Name, AcademicYearID: year.ID, StartDate: day(term.StartDate), EndDate: day(term.EndDate), Status: "closed"}, 200)
 	call(AssignCourseOffering, adminUser.ID, fmt.Sprint(class.ID), req, 400)
 	call(CreateAttendanceSession, tu2.ID, "", CreateAttendanceSessionRequest{CourseOfferingID: offering.ID}, 400)

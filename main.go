@@ -128,10 +128,16 @@ func main() {
 		auth.POST("/class-offers/:id/reject", middleware.RoleRequired("teacher"), controllers.RejectClassOffer)
 
 		// U-14, U-15: Create Student + Delete Teacher
+		auth.GET("/rooms", middleware.RoleRequired("admin"), controllers.ListRooms)
+		auth.POST("/rooms", middleware.RoleRequired("admin"), controllers.SaveRoom)
+		auth.PUT("/rooms/:id", middleware.RoleRequired("admin"), controllers.SaveRoom)
 		auth.GET("/students", middleware.RoleRequired("admin"), controllers.ListStudents)
 		auth.POST("/students", middleware.RoleRequired("admin"), controllers.CreateStudent)
+		auth.PUT("/students/:id", middleware.RoleRequired("admin"), controllers.UpdateStudent)
+		auth.DELETE("/students/:id", middleware.RoleRequired("admin"), controllers.DeleteStudent)
 		auth.GET("/teachers", middleware.RoleRequired("admin"), controllers.ListTeachers)
 		auth.POST("/teachers", middleware.RoleRequired("admin"), controllers.CreateTeacher)
+		auth.PUT("/teachers/:id", middleware.RoleRequired("admin"), controllers.UpdateTeacher)
 		auth.DELETE("/teachers/:id", middleware.RoleRequired("admin"), controllers.DeleteTeacher)
 		auth.POST("/classes/:id/students", middleware.RoleRequired("admin"), controllers.AddStudentsToClass)
 
@@ -160,6 +166,7 @@ func main() {
 		// U-22, U-26: Assignment Submission + Exercise
 		auth.POST("/exercises", middleware.RoleRequired("teacher"), controllers.CreateExercise)
 		auth.GET("/exercises", middleware.RoleRequired("teacher"), controllers.ListTeacherExercises)
+		auth.PUT("/exercises/:id/availability", middleware.RoleRequired("teacher"), controllers.UpdateExerciseAvailability)
 		auth.GET("/exercises/:id/submissions", middleware.RoleRequired("teacher"), controllers.ListExerciseSubmissions)
 		auth.GET("/student/exercises", middleware.RoleRequired("student"), controllers.ListStudentExercises)
 		auth.POST("/exercises/:id/submissions", middleware.RoleRequired("student"), controllers.SubmitExercise)
