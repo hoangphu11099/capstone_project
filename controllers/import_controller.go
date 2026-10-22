@@ -30,6 +30,7 @@ type TeacherImportItem struct {
 	Phone         string `json:"phone"`
 	Address       string `json:"address"`
 	Qualification string `json:"qualification"`
+	MajorCode     string `json:"majorCode"`
 }
 
 type StudentImportItem struct {
@@ -182,7 +183,7 @@ func parseTeacherImportFile(r io.Reader, filename string) ([]TeacherImportItem, 
 
 	var items []TeacherImportItem
 	for _, row := range rows[1:] {
-		row = normalizeCSVRow(row, 8)
+		row = normalizeCSVRow(row, 9)
 		if isEmptyRow(row) {
 			continue
 		}
@@ -195,6 +196,7 @@ func parseTeacherImportFile(r io.Reader, filename string) ([]TeacherImportItem, 
 			Phone:         row[5],
 			Address:       row[6],
 			Qualification: row[7],
+			MajorCode:     row[8],
 		})
 	}
 	return items, nil
@@ -345,6 +347,13 @@ func importOneTeacher(item TeacherImportItem, roleID uint) error {
 		teacher.Phone = strings.TrimSpace(item.Phone)
 		teacher.Address = strings.TrimSpace(item.Address)
 		teacher.Qualification = strings.TrimSpace(item.Qualification)
+		if code := strings.ToUpper(strings.TrimSpace(item.MajorCode)); code != "" {
+			var major models.Major
+			if err := tx.Where("code = ? AND is_active = ?", code, true).First(&major).Error; err != nil {
+				return fmt.Errorf("ngành dạy không hợp lệ: %s", code)
+			}
+			teacher.MajorID = major.ID
+		}
 		if teacher.HireDate.IsZero() {
 			teacher.HireDate = time.Now()
 		}
@@ -352,7 +361,7 @@ func importOneTeacher(item TeacherImportItem, roleID uint) error {
 		if teacher.ID == 0 {
 			return tx.Create(&teacher).Error
 		}
-		return tx.Omit("MajorID").Save(&teacher).Error
+		return tx.Save(&teacher).Error
 	})
 }
 func parseImportedDate(value string) (time.Time, error) {

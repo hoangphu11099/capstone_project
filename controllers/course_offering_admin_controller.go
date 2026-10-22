@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type AssignCourseOfferingRequest struct {
@@ -57,127 +59,8 @@ func AssignCourseOffering(c *gin.Context) {
 	classID := uint(classID64)
 	var savedOffering models.CourseOffering
 	err = config.DB.Transaction(func(tx *gorm.DB) error {
-		var class models.Class
-		if err := tx.Preload("Semester").First(&class, classID).Error; err != nil {
-			return err
-		}
-		var semester models.Semester
-		if err := tx.First(&semester, req.SemesterID).Error; err != nil {
-			return err
-		}
-		if semester.Status == "closed" {
-			return errors.New("học kỳ đã đóng; hãy chọn học kỳ đang mở hoặc sắp tới")
-		}
-		if class.Status != "open" {
-			return errors.New("lớp đã đóng")
-		}
-		var course models.Course
-		if err := tx.First(&course, req.CourseID).Error; err != nil {
-			return err
-		}
-		if course.MajorID != class.MajorID {
-			return errors.New("môn học không thuộc chuyên ngành của lớp")
-		}
-		var teacher models.Teacher
-		if err := tx.First(&teacher, req.TeacherID).Error; err != nil {
-			return err
-		}
-		if teacher.MajorID != 0 && teacher.MajorID != class.MajorID {
-			return errors.New("giảng viên không thuộc chuyên ngành của lớp")
-		}
-		var room models.Room
-		if err := tx.First(&room, req.RoomID).Error; err != nil {
-			return err
-		}
-
-		var offering models.CourseOffering
-		lookup := tx.Where("class_id = ? AND course_id = ? AND semester_id = ?", class.ID, course.ID, req.SemesterID).First(&offering)
-		if lookup.Error != nil && !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
-			return lookup.Error
-		}
-		excludeID := offering.ID
-		var retained []models.Schedule
-		if offering.ID != 0 {
-			if err := tx.Where("course_offering_id = ?", offering.ID).Find(&retained).Error; err != nil {
-				return err
-			}
-		}
-		for _, existing := range retained {
-			replaced := false
-			for _, candidate := range candidates {
-				if (existing.FullDate == nil && candidate.FullDate == nil) || (existing.FullDate != nil && candidate.FullDate != nil && existing.FullDate.Format("2006-01-02") == candidate.FullDate.Format("2006-01-02")) {
-					replaced = true
-					break
-				}
-			}
-			if replaced {
-				continue
-			}
-			for _, candidate := range candidates {
-				if schedulesOverlap(existing, candidate) {
-					return errors.New("lịch mới trùng với lịch hiện có của học phần")
-				}
-			}
-			if err := checkOfferingScheduleConflict(tx, req.TeacherID, req.RoomID, req.SemesterID, class.ID, excludeID, existing); err != nil {
-				return err
-			}
-		}
-		for _, candidate := range candidates {
-			if candidate.FullDate != nil && (candidate.FullDate.Format("2006-01-02") < semester.StartDate.Format("2006-01-02") || candidate.FullDate.Format("2006-01-02") > semester.EndDate.Format("2006-01-02")) {
-				return errors.New("ngày dạy phải nằm trong học kỳ")
-			}
-			if err := checkOfferingScheduleConflict(tx, req.TeacherID, req.RoomID, req.SemesterID, class.ID, excludeID, candidate); err != nil {
-				return err
-			}
-		}
-
-		offering.CourseID = course.ID
-		offering.ClassID = class.ID
-		offering.TeacherID = teacher.ID
-		offering.SemesterID = req.SemesterID
-		offering.RoomID = room.ID
-		offering.Status = "open"
-		if offering.ID == 0 {
-			if err := tx.Create(&offering).Error; err != nil {
-				return err
-			}
-		} else if err := tx.Save(&offering).Error; err != nil {
-			return err
-		}
-
-		offeringID := offering.ID
-		for _, candidate := range candidates {
-			var schedule models.Schedule
-			query := tx.Where("course_offering_id = ?", offering.ID)
-			if candidate.FullDate != nil {
-				query = query.Where("full_date = ?", candidate.FullDate.Format("2006-01-02"))
-			} else {
-				query = query.Where("full_date IS NULL")
-			}
-			lookup := query.First(&schedule)
-			if lookup.Error != nil && !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
-				return lookup.Error
-			}
-			candidate.ID = schedule.ID
-			candidate.ClassID = class.ID
-			candidate.CourseOfferingID = &offeringID
-			if err := tx.Save(&candidate).Error; err != nil {
-				return err
-			}
-		}
-
-		var students []models.Student
-		if err := tx.Where("class_id = ?", class.ID).Find(&students).Error; err != nil {
-			return err
-		}
-		for _, student := range students {
-			if err := ensureEnrollment(tx, student.ID, offering); err != nil {
-				return err
-			}
-		}
-		savedOffering = offering
-		return nil
-	})
+		return applyCourseAssignment(tx, classID, req, candidates, &savedOffering, false)
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -345,5 +228,132 @@ func validateFutureTeachingDates(schedules []models.Schedule, now time.Time) err
 			return errors.New("không được tạo hoặc sửa lịch dạy vào ngày trong quá khứ")
 		}
 	}
+	return nil
+}
+
+func applyCourseAssignment(tx *gorm.DB, classID uint, req AssignCourseOfferingRequest, candidates []models.Schedule, savedOffering *models.CourseOffering, validateOnly bool) error {
+	var class models.Class
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Preload("Semester").First(&class, classID).Error; err != nil {
+		return err
+	}
+	var semester models.Semester
+	if err := tx.First(&semester, req.SemesterID).Error; err != nil {
+		return err
+	}
+	if semester.Status == "closed" {
+		return errors.New("học kỳ đã đóng; hãy chọn học kỳ đang mở hoặc sắp tới")
+	}
+	if class.Status != "open" {
+		return errors.New("lớp đã đóng")
+	}
+	var course models.Course
+	if err := tx.First(&course, req.CourseID).Error; err != nil {
+		return err
+	}
+	if course.MajorID != class.MajorID {
+		return errors.New("môn học không thuộc chuyên ngành của lớp")
+	}
+	var teacher models.Teacher
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&teacher, req.TeacherID).Error; err != nil {
+		return err
+	}
+	if teacher.MajorID == 0 || teacher.MajorID != class.MajorID {
+		return errors.New("giảng viên không thuộc chuyên ngành của lớp")
+	}
+	var room models.Room
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&room, req.RoomID).Error; err != nil {
+		return err
+	}
+
+	var offering models.CourseOffering
+	lookup := tx.Where("class_id = ? AND course_id = ? AND semester_id = ?", class.ID, course.ID, req.SemesterID).First(&offering)
+	if lookup.Error != nil && !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+		return lookup.Error
+	}
+	excludeID := offering.ID
+	var retained []models.Schedule
+	if offering.ID != 0 {
+		if err := tx.Where("course_offering_id = ?", offering.ID).Find(&retained).Error; err != nil {
+			return err
+		}
+	}
+	for _, existing := range retained {
+		replaced := false
+		for _, candidate := range candidates {
+			if (existing.FullDate == nil && candidate.FullDate == nil) || (existing.FullDate != nil && candidate.FullDate != nil && existing.FullDate.Format("2006-01-02") == candidate.FullDate.Format("2006-01-02")) {
+				replaced = true
+				break
+			}
+		}
+		if replaced {
+			continue
+		}
+		for _, candidate := range candidates {
+			if schedulesOverlap(existing, candidate) {
+				return errors.New("lịch mới trùng với lịch hiện có của học phần")
+			}
+		}
+		if err := checkOfferingScheduleConflict(tx, req.TeacherID, req.RoomID, req.SemesterID, class.ID, excludeID, existing); err != nil {
+			return err
+		}
+	}
+	for _, candidate := range candidates {
+		if candidate.FullDate != nil && (candidate.FullDate.Format("2006-01-02") < semester.StartDate.Format("2006-01-02") || candidate.FullDate.Format("2006-01-02") > semester.EndDate.Format("2006-01-02")) {
+			return errors.New("ngày dạy phải nằm trong học kỳ")
+		}
+		if err := checkOfferingScheduleConflict(tx, req.TeacherID, req.RoomID, req.SemesterID, class.ID, excludeID, candidate); err != nil {
+			return err
+		}
+	}
+
+	if validateOnly {
+		*savedOffering = offering
+		return nil
+	}
+	offering.CourseID = course.ID
+	offering.ClassID = class.ID
+	offering.TeacherID = teacher.ID
+	offering.SemesterID = req.SemesterID
+	offering.RoomID = room.ID
+	offering.Status = "open"
+	if offering.ID == 0 {
+		if err := tx.Create(&offering).Error; err != nil {
+			return err
+		}
+	} else if err := tx.Save(&offering).Error; err != nil {
+		return err
+	}
+
+	offeringID := offering.ID
+	for _, candidate := range candidates {
+		var schedule models.Schedule
+		query := tx.Where("course_offering_id = ?", offering.ID)
+		if candidate.FullDate != nil {
+			query = query.Where("full_date = ?", candidate.FullDate.Format("2006-01-02"))
+		} else {
+			query = query.Where("full_date IS NULL")
+		}
+		lookup := query.First(&schedule)
+		if lookup.Error != nil && !errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
+			return lookup.Error
+		}
+		candidate.ID = schedule.ID
+		candidate.ClassID = class.ID
+		candidate.CourseOfferingID = &offeringID
+		if err := tx.Save(&candidate).Error; err != nil {
+			return err
+		}
+	}
+
+	var students []models.Student
+	if err := tx.Where("class_id = ?", class.ID).Find(&students).Error; err != nil {
+		return err
+	}
+	for _, student := range students {
+		if err := ensureEnrollment(tx, student.ID, offering); err != nil {
+			return err
+		}
+	}
+	*savedOffering = offering
 	return nil
 }

@@ -22,7 +22,8 @@ type AttendanceSession struct {
 	Code      string `gorm:"uniqueIndex;size:128;not null"`
 	ClassDate time.Time
 	ExpiresAt time.Time
-	IsActive  bool `gorm:"default:true"`
+	Status    string `gorm:"size:32;default:confirmed"`
+	IsActive  bool   `gorm:"default:true"`
 	Note      string
 
 	CreatedAt time.Time

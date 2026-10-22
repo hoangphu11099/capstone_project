@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const attendanceQRDuration = time.Minute
@@ -129,11 +130,20 @@ func AttendanceByQR(c *gin.Context) {
 	attendance.Note = "Điểm danh bằng QR"
 	attendance.CheckedInAt = &checkedAt
 
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		err = config.DB.Create(&attendance).Error
-	} else {
-		err = config.DB.Save(&attendance).Error
-	}
+	isNew := errors.Is(err, gorm.ErrRecordNotFound)
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		var current models.AttendanceSession
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, session.ID).Error; err != nil {
+			return err
+		}
+		if !current.IsActive || current.Status != "pending" || current.Code != code || attendanceNow().After(current.ExpiresAt) {
+			return errors.New("Phiên hoặc mã QR đã kết thúc")
+		}
+		if isNew {
+			return tx.Create(&attendance).Error
+		}
+		return tx.Save(&attendance).Error
+	})
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Điểm danh thất bại", "error": err.Error()})
@@ -141,7 +151,7 @@ func AttendanceByQR(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":   "Điểm danh thành công",
+		"message":   "Đã quét QR, chờ giảng viên xác nhận điểm danh",
 		"data":      attendance,
 		"expiresAt": session.ExpiresAt,
 	})
@@ -157,6 +167,7 @@ func ListMyAttendances(c *gin.Context) {
 	if err := config.DB.Preload("Enrollment.Course").Preload("Enrollment.Class").Preload("AttendanceSession").
 		Joins("JOIN enrollments ON enrollments.id = attendances.enrollment_id").
 		Where("enrollments.student_id = ?", student.ID).
+		Where("attendance_session_id IS NULL OR attendance_session_id IN (SELECT id FROM attendance_sessions WHERE status = ?)", "confirmed").
 		Order("attendances.class_date DESC, attendances.id DESC").
 		Find(&attendances).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi lấy lịch sử điểm danh", "error": err.Error()})
@@ -278,14 +289,17 @@ func CreateAttendanceSession(c *gin.Context) {
 		ClassDate:        dayStart,
 		ExpiresAt:        now.Add(attendanceQRDuration),
 		IsActive:         true,
+		Status:           "pending",
 		Note:             strings.TrimSpace(req.Note),
 	}
 
 	if err := config.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&models.AttendanceSession{}).
-			Where("course_offering_id = ? AND is_active = ?", offering.ID, true).
-			Updates(map[string]interface{}{"is_active": false}).Error; err != nil {
+		var existing int64
+		if err := tx.Model(&models.AttendanceSession{}).Where("course_offering_id = ? AND DATE(class_date) = DATE(?) AND status <> ?", offering.ID, dayStart, "cancelled").Count(&existing).Error; err != nil {
 			return err
+		}
+		if existing > 0 {
+			return errors.New("Buổi học đã có phiên điểm danh. Hãy xác nhận hoặc hủy phiên hiện tại")
 		}
 		if err := tx.Create(&session).Error; err != nil {
 			return err
@@ -393,6 +407,10 @@ func ListAttendanceSessionRecords(c *gin.Context) {
 		return
 	}
 
+	if session.Status == "cancelled" {
+		c.JSON(200, gin.H{"session": session, "data": []interface{}{}})
+		return
+	}
 	var enrollments []models.Enrollment
 	enrollmentQuery := config.DB.Preload("Student.User").Preload("Course").Where("status <> ?", "cancelled")
 	if session.CourseOfferingID != nil {
@@ -481,9 +499,24 @@ func UpdateAttendanceStatus(c *gin.Context) {
 		return
 	}
 
+	if attendance.AttendanceSessionID != nil && attendance.AttendanceSession.Status != "pending" {
+		c.JSON(400, gin.H{"message": "Phiên đã kết thúc, không thể sửa"})
+		return
+	}
 	attendance.Status = status
 	attendance.Note = strings.TrimSpace(req.Note)
-	if err := config.DB.Save(&attendance).Error; err != nil {
+	if err := config.DB.Transaction(func(tx *gorm.DB) error {
+		if attendance.AttendanceSessionID != nil {
+			var current models.AttendanceSession
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, *attendance.AttendanceSessionID).Error; err != nil {
+				return err
+			}
+			if current.Status != "pending" {
+				return errors.New("Phiên đã kết thúc")
+			}
+		}
+		return tx.Save(&attendance).Error
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Cập nhật điểm danh thất bại", "error": err.Error()})
 		return
 	}
@@ -530,16 +563,42 @@ func CloseAttendanceSession(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if !session.IsActive {
-		c.JSON(http.StatusOK, gin.H{"message": "Phiên điểm danh đã đóng", "data": session})
+	finishAttendanceSession(c, session, "confirmed")
+}
+
+func CancelAttendanceSession(c *gin.Context) {
+	teacher, ok := getCurrentTeacher(c)
+	if !ok {
+		return
+	}
+	session, ok := findTeacherAttendanceSession(c, teacher.ID)
+	if !ok {
+		return
+	}
+	finishAttendanceSession(c, session, "cancelled")
+}
+
+func finishAttendanceSession(c *gin.Context, session models.AttendanceSession, status string) {
+	err := config.DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.AttendanceSession{}).Where("id = ? AND status = ?", session.ID, "pending").Updates(map[string]interface{}{"status": status, "is_active": false})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errors.New("Phiên đã xác nhận hoặc đã hủy")
+		}
+		if status == "cancelled" {
+			return tx.Where("attendance_session_id = ?", session.ID).Delete(&models.Attendance{}).Error
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(400, gin.H{"message": err.Error()})
 		return
 	}
 	session.IsActive = false
-	if err := config.DB.Save(&session).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Không thể đóng phiên điểm danh", "error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"message": "Đã đóng phiên điểm danh", "data": session})
+	session.Status = status
+	c.JSON(200, gin.H{"message": map[string]string{"confirmed": "Đã xác nhận điểm danh", "cancelled": "Đã hủy phiên điểm danh"}[status], "data": session})
 }
 
 func findTeacherAttendanceSession(c *gin.Context, teacherID uint) (models.AttendanceSession, bool) {
@@ -593,7 +652,14 @@ func rotateAttendanceSessionQRCode(session *models.AttendanceSession) error {
 	session.ExpiresAt = attendanceNow().Add(attendanceQRDuration)
 	session.IsActive = true
 
-	return config.DB.Save(session).Error
+	result := config.DB.Model(&models.AttendanceSession{}).Where("id = ? AND is_active = ? AND status = ?", session.ID, true, "pending").Updates(map[string]interface{}{"code": session.Code, "expires_at": session.ExpiresAt})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return errors.New("Phiên đã kết thúc")
+	}
+	return nil
 }
 
 func attendanceLocation() *time.Location {

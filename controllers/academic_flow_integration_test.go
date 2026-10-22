@@ -242,6 +242,29 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		t.Fatal("teacher records did not reflect successful student QR check-in")
 	}
 
+	history := call(ListMyAttendances, su.ID, "", nil, 200)
+	var pendingHistory []models.Attendance
+	json.Unmarshal(history["data"], &pendingHistory)
+	if len(pendingHistory) != 0 {
+		t.Fatal("unconfirmed attendance leaked into student history")
+	}
+	call(CancelAttendanceSession, tu.ID, fmt.Sprint(attendanceSession.ID), nil, 403)
+	call(CancelAttendanceSession, tu2.ID, fmt.Sprint(attendanceSession.ID), nil, 200)
+	payload = call(ListAttendanceSessionRecords, tu2.ID, fmt.Sprint(attendanceSession.ID), nil, 200)
+	json.Unmarshal(payload["data"], &liveRecords)
+	if len(liveRecords) != 0 {
+		t.Fatal("cancelled session recreated attendance")
+	}
+	payload = call(CreateAttendanceSession, tu2.ID, "", CreateAttendanceSessionRequest{CourseOfferingID: offering.ID}, 200)
+	json.Unmarshal(payload["data"], &attendanceSession)
+	call(AttendanceByQR, su.ID, "", AttendanceQRRequest{Code: attendanceSession.Code}, 200)
+	call(CloseAttendanceSession, tu2.ID, fmt.Sprint(attendanceSession.ID), nil, 200)
+	call(AttendanceByQR, su.ID, "", AttendanceQRRequest{Code: attendanceSession.Code}, 400)
+	history = call(ListMyAttendances, su.ID, "", nil, 200)
+	json.Unmarshal(history["data"], &pendingHistory)
+	if len(pendingHistory) != 1 || pendingHistory[0].Status != "present" {
+		t.Fatal("confirmed attendance missing from history")
+	}
 	var enrollment models.Enrollment
 	db.Where("student_id = ? AND course_offering_id = ?", student.ID, offering.ID).First(&enrollment)
 	call(UpsertGrade, tu.ID, "", GradeRequest{EnrollmentID: enrollment.ID, AssignmentScore: 80, MidtermScore: 80, FinalScore: 80}, 403)
@@ -249,6 +272,27 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	var grade models.Grade
 	db.Where("enrollment_id = ?", enrollment.ID).First(&grade)
 	call(ApproveGrade, tu2.ID, fmt.Sprint(grade.ID), nil, 200)
+	for _, endpoint := range []struct {
+		handler     gin.HandlerFunc
+		id          uint
+		classScoped bool
+	}{{AdminClassLearningDetail, class.ID, true}, {StudentLearningDetail, student.ID, false}} {
+		learningPayload := call(endpoint.handler, adminUser.ID, fmt.Sprint(endpoint.id), nil, 200)
+		var learningRows []models.Enrollment
+		json.Unmarshal(learningPayload["data"], &learningRows)
+		found := false
+		for _, row := range learningRows {
+			if row.ID == enrollment.ID {
+				found = row.Grade != nil && row.Grade.TotalScore == 80 && row.Grade.Status == "Approved" && len(row.Attendances) > 0 && row.CourseOffering != nil && len(row.CourseOffering.Schedules) > 0
+			}
+			if endpoint.classScoped && row.ClassID != class.ID {
+				t.Fatal("class learning details included another class")
+			}
+		}
+		if !found {
+			t.Fatal("learning details omitted grade, attendance, or planned lessons")
+		}
+	}
 	var transcript models.Transcript
 	db.Where("enrollment_id = ?", enrollment.ID).First(&transcript)
 	if transcript.SemesterID != term.ID {
@@ -340,6 +384,107 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		t.Fatal("schedule change resurrected cancelled enrollment")
 	}
 	call(GetMetadata, adminUser.ID, "", nil, 200)
+	consultation := consultationRequest{FullName: "Nguyễn An", Phone: "0901234567", Email: "consultation@example.test", Program: "Lập trình phần mềm", Location: "Online", PreferredSession: "Tối", Consent: true}
+	consultationPayload := call(CreatePublicConsultation, 0, "", consultation, 201)
+	var consultationID uint
+	json.Unmarshal(consultationPayload["reference"], &consultationID)
+	if consultationID == 0 {
+		t.Fatal("consultation reference missing")
+	}
+	call(CreatePublicConsultation, 0, "", consultation, 429)
+	consultationPayload = call(ListConsultations, adminUser.ID, "", nil, 200)
+	var consultations []models.Consultation
+	json.Unmarshal(consultationPayload["data"], &consultations)
+	if len(consultations) != 1 || consultations[0].Phone != "0901234567" || consultations[0].ConsentAt.IsZero() {
+		t.Fatal("consultation or consent not persisted")
+	}
+	call(UpdateConsultation, adminUser.ID, fmt.Sprint(consultationID), map[string]string{"status": "contacted"}, 200)
+	var savedConsultation models.Consultation
+	db.First(&savedConsultation, consultationID)
+	if savedConsultation.Status != "contacted" {
+		t.Fatal("consultation status not updated")
+	}
+	facultyPayload := call(ListPublicFaculty, 0, "", nil, 200)
+	var facultyProfiles []struct {
+		ID        uint   `json:"id"`
+		Biography string `json:"biography"`
+		AvatarURL string `json:"avatarUrl"`
+	}
+	json.Unmarshal(facultyPayload["data"], &facultyProfiles)
+	if len(facultyProfiles) == 0 {
+		t.Fatal("missing faculty for profile test")
+	}
+	facultyID := fmt.Sprint(facultyProfiles[0].ID)
+	call(UpdateFacultyProfile, adminUser.ID, facultyID, map[string]string{"biography": "Giới thiệu chuyên môn đã cập nhật", "avatarUrl": "/faculty.jpg"}, 200)
+	facultyPayload = call(ListPublicFaculty, 0, "", nil, 200)
+	json.Unmarshal(facultyPayload["data"], &facultyProfiles)
+	if facultyProfiles[0].Biography != "Giới thiệu chuyên môn đã cập nhật" || facultyProfiles[0].AvatarURL != "/faculty.jpg" {
+		t.Fatal("faculty biography not persisted")
+	}
+	call(UpdateFacultyProfile, adminUser.ID, facultyID, map[string]string{"avatarUrl": "javascript:alert(1)"}, 400)
+
+	updateProgramImage := func(c *gin.Context) {
+		c.Params = append(c.Params, gin.Param{Key: "slug", Value: c.Param("id")})
+		UpdateProgramImage(c)
+	}
+	// Program image overrides persist across reads and can return to bundled defaults.
+	call(updateProgramImage, adminUser.ID, "lap-trinh-phan-mem", map[string]string{"imageUrl": "/new-program.jpg"}, 200)
+	imagePayload := call(ListProgramImages, 0, "", nil, 200)
+	var programImages []models.ProgramImage
+	json.Unmarshal(imagePayload["data"], &programImages)
+	if len(programImages) != 1 || programImages[0].ImageURL != "/new-program.jpg" {
+		t.Fatal("program image override not persisted")
+	}
+	call(updateProgramImage, adminUser.ID, "lap-trinh-phan-mem", map[string]string{"imageUrl": "javascript:alert(1)"}, 400)
+	call(updateProgramImage, adminUser.ID, "lap-trinh-phan-mem", map[string]string{"imageUrl": "//example.com/image.jpg"}, 400)
+	call(updateProgramImage, adminUser.ID, "lap-trinh-phan-mem", map[string]string{"imageUrl": ""}, 200)
+	var savedImage models.ProgramImage
+	db.First(&savedImage, "slug = ?", "lap-trinh-phan-mem")
+	if savedImage.ImageURL != "" {
+		t.Fatal("default image reset failed")
+	}
+	savePublicProgram := func(c *gin.Context) {
+		c.Params = append(c.Params, gin.Param{Key: "slug", Value: c.Param("id")})
+		SavePublicProgram(c)
+	}
+	programRequest := map[string]any{"slug": "nganh-thu-nghiem", "name": "Ngành thử nghiệm", "group": "Công nghệ", "symbol": "code", "image": "/test.jpg", "tagline": "Mô tả mới", "description": "Giới thiệu mới", "tools": []string{"React"}, "skills": []string{"Kỹ năng mới"}, "careers": []string{"Nghề nghiệp mới"}, "project": "Dự án mới", "stages": []map[string]any{{"title": "Chặng mới", "topics": []string{"Nội dung mới"}}}, "published": true}
+	call(savePublicProgram, adminUser.ID, "nganh-thu-nghiem", programRequest, 200)
+	programPayload := call(ListPublicPrograms, 0, "", nil, 200)
+	var publicPrograms []publicProgramContent
+	json.Unmarshal(programPayload["data"], &publicPrograms)
+	if len(publicPrograms) != 1 || publicPrograms[0].Name != "Ngành thử nghiệm" || publicPrograms[0].Stages[0].Topics[0] != "Nội dung mới" {
+		t.Fatal("program content did not persist")
+	}
+	programRequest["published"] = false
+	programRequest["name"] = "Đổi tên ngành"
+	call(savePublicProgram, adminUser.ID, "nganh-thu-nghiem", programRequest, 200)
+	programPayload = call(ListPublicPrograms, 0, "", nil, 200)
+	json.Unmarshal(programPayload["data"], &publicPrograms)
+	if publicPrograms[0].Published || publicPrograms[0].Name != "Đổi tên ngành" {
+		t.Fatal("program visibility or edited content was lost")
+	}
+	programRequest["stages"] = []map[string]any{}
+	call(savePublicProgram, adminUser.ID, "nganh-thu-nghiem", programRequest, 400)
+	studentStoryRequest := schoolPostRequest{Title: "Hành trình đồ án", Content: "Nội dung câu chuyện", Excerpt: "Trải nghiệm sinh viên", Category: "student", IsPublished: true}
+	storyPayload := call(CreateAdminPost, adminUser.ID, "", studentStoryRequest, 201)
+	var story models.SchoolPost
+	json.Unmarshal(storyPayload["data"], &story)
+	if story.Category != "student" {
+		t.Fatal("student story category not persisted")
+	}
+	storiesPayload := call(GetPublicPosts, 0, "", nil, 200)
+	var publishedStories []models.SchoolPost
+	json.Unmarshal(storiesPayload["data"], &publishedStories)
+	foundStory := false
+	for _, item := range publishedStories {
+		if item.ID == story.ID && item.Category == "student" {
+			foundStory = true
+		}
+	}
+	if !foundStory {
+		t.Fatal("published student story missing from public API")
+	}
+
 	call(ListAcademicYears, adminUser.ID, "", nil, 200)
 	call(ListSemesters, adminUser.ID, "", nil, 200)
 	call(ListAdminCourseOfferings, adminUser.ID, "", nil, 200)
@@ -350,19 +495,33 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	examReq.SemesterID = term.ID
 	examReq.ExamDate = day(now.AddDate(0, 0, 8))
 	call(CreateExamSchedule, adminUser.ID, "", examReq, 201)
-	payload = call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{Username: "created-teacher", FullName: "Created Teacher", Email: "created-teacher@example.test"}, 201)
+	studentExams, err := personalExams(student.ID, 0)
+	if err != nil || len(studentExams) == 0 {
+		t.Fatalf("student missing exam calendar: %v", err)
+	}
+	teacherExams, err := personalExams(0, offering.TeacherID)
+	if err != nil || len(teacherExams) == 0 {
+		t.Fatalf("teacher missing exam calendar: %v", err)
+	}
+	var examNotifications int64
+	db.Model(&models.Notification{}).Where("recipient_user_id = ? AND subject LIKE ?", su.ID, "Lịch thi%").Count(&examNotifications)
+	if examNotifications == 0 {
+		t.Fatal("student did not receive exam notification")
+	}
+
+	payload = call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{MajorID: major.ID, Username: "created-teacher", FullName: "Created Teacher", Email: "created-teacher@example.test"}, 201)
 	var generated models.Teacher
 	json.Unmarshal(payload["data"], &generated)
 	if !strings.HasPrefix(generated.TeacherCode, "GV") || len(generated.TeacherCode) != 12 {
 		t.Fatal("missing generated teacher code")
 	}
-	payload = call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{Username: "created-teacher-2", FullName: "Second Teacher", Email: "created-teacher-2@example.test"}, 201)
+	payload = call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{MajorID: major.ID, Username: "created-teacher-2", FullName: "Second Teacher", Email: "created-teacher-2@example.test"}, 201)
 	var generated2 models.Teacher
 	json.Unmarshal(payload["data"], &generated2)
 	if generated2.TeacherCode == generated.TeacherCode {
 		t.Fatal("duplicate generated code")
 	}
-	call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{Username: "created-teacher", FullName: "Must not overwrite", Email: "duplicate@example.test"}, 400)
+	call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{MajorID: major.ID, Username: "created-teacher", FullName: "Must not overwrite", Email: "duplicate@example.test"}, 400)
 	var original models.User
 	db.First(&original, generated.UserID)
 	if original.FullName != "Created Teacher" {
@@ -376,13 +535,19 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	if afterImport.TeacherCode != generated.TeacherCode {
 		t.Fatal("import without code changed existing code")
 	}
-	if err := importOneTeacher(TeacherImportItem{Username: "imported-new", FullName: "Imported Teacher", Email: "imported-new@example.test"}, teacherRole.ID); err != nil {
+	if afterImport.MajorID != major.ID {
+		t.Fatal("legacy import erased teaching major")
+	}
+	if err := importOneTeacher(TeacherImportItem{Username: "imported-new", FullName: "Imported Teacher", Email: "imported-new@example.test", MajorCode: major.Code}, teacherRole.ID); err != nil {
 		t.Fatal(err)
 	}
 	var imported models.Teacher
 	db.Joins("JOIN users ON users.id = teachers.user_id").Where("users.username = ?", "imported-new").First(&imported)
 	if !strings.HasPrefix(imported.TeacherCode, "GV") {
 		t.Fatal("import did not generate teacher code")
+	}
+	if imported.MajorID != major.ID {
+		t.Fatal("import did not save teaching major")
 	}
 
 	call(CreateStudent, adminUser.ID, "", CreateStudentRequest{Username: "created-student", FullName: "Created Student", Email: "created-student@example.test", ClassID: class.ID}, 201)
@@ -412,11 +577,20 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	call(DeleteStudent, adminUser.ID, fmt.Sprint(deletable.ID), nil, 404)
 
 	var beforeTeacherUpdate models.User
+	newMajorPayload := call(CreateMajor, adminUser.ID, "", map[string]string{"code": "BIZ", "name": "Business administration"}, 201)
+	var teacherMajor models.Major
+	json.Unmarshal(newMajorPayload["data"], &teacherMajor)
+	call(CreateMajor, adminUser.ID, "", map[string]string{"code": "biz", "name": "Duplicate"}, 400)
+	call(CreateMajor, adminUser.ID, "", map[string]string{"code": "", "name": "Missing code"}, 400)
+	call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{Username: "no-major", FullName: "No major"}, 400)
 	db.First(&beforeTeacherUpdate, generated.UserID)
-	teacherUpdate := CreateTeacherRequest{Username: "created-teacher", FullName: "Updated Teacher", Email: "created-teacher@example.test", Phone: "0123456789", Qualification: "Doctor", TeacherCode: "SHOULD_NOT_CHANGE"}
+	teacherUpdate := CreateTeacherRequest{MajorID: teacherMajor.ID, Username: "created-teacher", FullName: "Updated Teacher", Email: "created-teacher@example.test", Phone: "0123456789", Qualification: "Doctor", TeacherCode: "SHOULD_NOT_CHANGE"}
 	call(UpdateTeacher, adminUser.ID, fmt.Sprint(generated.ID), teacherUpdate, 200)
 	var editedTeacher models.Teacher
 	db.Preload("User").First(&editedTeacher, generated.ID)
+	if editedTeacher.MajorID != teacherMajor.ID {
+		t.Fatal("teacher update failed to persist teaching major")
+	}
 	if editedTeacher.TeacherCode != generated.TeacherCode || editedTeacher.Qualification != "Doctor" || editedTeacher.User.FullName != "Updated Teacher" || editedTeacher.User.Password != beforeTeacherUpdate.Password {
 		t.Fatal("teacher update changed code/password or failed to save profile")
 	}
@@ -466,8 +640,182 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	if !foundRoom {
 		t.Fatal("created room missing from scheduling metadata")
 	}
+
+	t.Run("teaching offer creates schedule only after acceptance", func(t *testing.T) {
+		offerClass := models.Class{ClassCode: "OFFER_TEST", MajorID: major.ID, Status: "open", MaxStudents: 30}
+		create(&offerClass)
+		offerCourse := models.Course{Code: "OFFER_COURSE", Name: "Offer course", MajorID: major.ID, IsActive: true}
+		create(&offerCourse)
+		offerStudentUser := user("offer-student", studentRole.ID)
+		offerStudent := models.Student{UserID: offerStudentUser.ID, StudentCode: "OFFER_S", ClassID: offerClass.ID, EnrollmentDate: now, DateOfBirth: now.AddDate(-20, 0, 0)}
+		create(&offerStudent)
+		input := CreateClassOfferRequest{ClassID: offerClass.ID, TeacherID: teacher2.ID, CourseID: offerCourse.ID, SemesterID: term.ID, RoomID: newRoom.ID, TeachingDates: []string{day(now.AddDate(0, 0, 30)), day(now.AddDate(0, 0, 37))}, StartTime: "22:00", EndTime: "23:00", Title: "Detailed plan"}
+		invalid := input
+		invalid.TeachingDates = nil
+		call(CreateClassOffer, adminUser.ID, "", invalid, 400)
+		result := call(CreateClassOffer, adminUser.ID, "", input, 201)
+		var offer models.ClassOffer
+		json.Unmarshal(result["data"], &offer)
+		var planned teachingOfferPlan
+		if json.Unmarshal([]byte(offer.PlanJSON), &planned) != nil || len(planned.Schedules) != 2 {
+			t.Fatal("missing immutable detailed plan")
+		}
+		call(CreateClassOffer, adminUser.ID, "", input, 400)
+		var count int64
+		db.Model(&models.CourseOffering{}).Where("class_id = ?", offerClass.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("pending offer assigned course before acceptance")
+		}
+		call(AcceptClassOffer, tu.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 404)
+		call(AcceptClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{Note: "Confirmed"}, 200)
+		call(AcceptClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 400)
+		var received models.CourseOffering
+		if err := db.Preload("Schedules").Preload("Enrollments").Where("class_id = ? AND course_id = ?", offerClass.ID, offerCourse.ID).First(&received).Error; err != nil {
+			t.Fatal(err)
+		}
+		if received.TeacherID != teacher2.ID || len(received.Schedules) != 2 || len(received.Enrollments) != 1 {
+			t.Fatal("acceptance did not atomically assign lessons and enroll student")
+		}
+		listed := call(ListTeacherClasses, tu2.ID, "", nil, 200)
+		var teacherClasses []models.Class
+		json.Unmarshal(listed["data"], &teacherClasses)
+		found := false
+		for _, c := range teacherClasses {
+			if c.ID == offerClass.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("accepted class missing from My Classes")
+		}
+		call(ViewTeacherSchedule, tu2.ID, "", nil, 200)
+
+		filtered := call(func(c *gin.Context) {
+			c.Request.URL.RawQuery = "classId=" + fmt.Sprint(offerClass.ID)
+			ListAdminCourseOfferings(c)
+		}, adminUser.ID, "", nil, 200)
+		var classOfferings []models.CourseOffering
+		json.Unmarshal(filtered["data"], &classOfferings)
+		if len(classOfferings) != 1 || classOfferings[0].ClassID != offerClass.ID {
+			t.Fatal("class details returned offerings from another class")
+		}
+		roster := call(func(c *gin.Context) {
+			c.Request.URL.RawQuery = "classId=" + fmt.Sprint(offerClass.ID)
+			ListStudents(c)
+		}, adminUser.ID, "", nil, 200)
+		var classStudents []models.Student
+		json.Unmarshal(roster["data"], &classStudents)
+		if len(classStudents) != 1 || classStudents[0].UserID != offerStudentUser.ID || classStudents[0].User.FullName == "" {
+			t.Fatal("class roster omitted student details or included students from other classes")
+		}
+		call(func(c *gin.Context) {
+			c.Request.URL.RawQuery = "classId=invalid"
+			ListStudents(c)
+		}, adminUser.ID, "", nil, 400)
+		classList := call(ListClasses, adminUser.ID, "", nil, 200)
+		var classesWithSchedules []models.Class
+		json.Unmarshal(classList["data"], &classesWithSchedules)
+		for _, row := range classesWithSchedules {
+			if row.ID == offerClass.ID && (len(row.CourseOfferings) != 1 || len(row.CourseOfferings[0].Schedules) == 0) {
+				t.Fatal("class list omitted schedules needed to determine completed status")
+			}
+		}
+
+		rejectedCourse := models.Course{Code: "REJECT_COURSE", Name: "Rejected", MajorID: major.ID, IsActive: true}
+		create(&rejectedCourse)
+		input.CourseID = rejectedCourse.ID
+		input.TeachingDates = []string{day(now.AddDate(0, 0, 31))}
+		result = call(CreateClassOffer, adminUser.ID, "", input, 201)
+		json.Unmarshal(result["data"], &offer)
+		call(RejectClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{Note: "Unavailable"}, 200)
+		db.Model(&models.CourseOffering{}).Where("class_id = ? AND course_id = ?", offerClass.ID, rejectedCourse.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("rejection created an offering")
+		}
+
+		// A conflict appearing after the proposal must be checked again at acceptance.
+		conflictCourse := models.Course{Code: "CONFLICT_OFFER", Name: "Conflict", MajorID: major.ID, IsActive: true}
+		create(&conflictCourse)
+		input.CourseID = conflictCourse.ID
+		input.TeachingDates = []string{day(now.AddDate(0, 0, 32))}
+		result = call(CreateClassOffer, adminUser.ID, "", input, 201)
+		json.Unmarshal(result["data"], &offer)
+		blockingClass := models.Class{ClassCode: "BLOCKING_OFFER", MajorID: major.ID, Status: "open"}
+		create(&blockingClass)
+		call(AssignCourseOffering, adminUser.ID, fmt.Sprint(blockingClass.ID), AssignCourseOfferingRequest{CourseID: conflictCourse.ID, TeacherID: teacher2.ID, SemesterID: term.ID, RoomID: room2.ID, TeachingDates: input.TeachingDates, StartTime: "22:00", EndTime: "23:00"}, 200)
+		call(AcceptClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 400)
+		db.First(&offer, offer.ID)
+		if offer.Status != "pending" {
+			t.Fatal("failed acceptance consumed offer")
+		}
+		db.Model(&models.CourseOffering{}).Where("class_id = ? AND course_id = ?", offerClass.ID, conflictCourse.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("failed acceptance partially saved schedule")
+		}
+		call(RejectClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 200)
+
+		// A changed plan must never be accepted using stale details.
+		staleCourse := models.Course{Code: "STALE_OFFER", Name: "Stale", MajorID: major.ID, IsActive: true}
+		create(&staleCourse)
+		input.CourseID = staleCourse.ID
+		input.TeachingDates = []string{day(now.AddDate(0, 0, 33))}
+		result = call(CreateClassOffer, adminUser.ID, "", input, 201)
+		json.Unmarshal(result["data"], &offer)
+		call(AssignCourseOffering, adminUser.ID, fmt.Sprint(offerClass.ID), AssignCourseOfferingRequest{CourseID: staleCourse.ID, TeacherID: teacher2.ID, SemesterID: term.ID, RoomID: newRoom.ID, TeachingDates: input.TeachingDates, StartTime: "20:00", EndTime: "21:00"}, 200)
+		call(AcceptClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 400)
+		call(RejectClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 200)
+		legacy := models.ClassOffer{ClassID: offerClass.ID, TeacherID: teacher2.ID, OfferedByUserID: adminUser.ID, Status: "pending", OfferedAt: now}
+		create(&legacy)
+		call(AcceptClassOffer, tu2.ID, fmt.Sprint(legacy.ID), ClassOfferResponseRequest{}, 400)
+		call(RejectClassOffer, tu2.ID, fmt.Sprint(legacy.ID), ClassOfferResponseRequest{}, 200)
+		listed = call(ListClasses, adminUser.ID, "", nil, 200)
+		var allClasses []models.Class
+		json.Unmarshal(listed["data"], &allClasses)
+		if len(allClasses) == 0 || allClasses[0].ID != blockingClass.ID {
+			t.Fatal("newest class is not first")
+		}
+	})
 	call(SaveSemester, adminUser.ID, fmt.Sprint(term.ID), PeriodRequest{Name: term.Name, AcademicYearID: year.ID, StartDate: day(term.StartDate), EndDate: day(term.EndDate), Status: "closed"}, 200)
 	call(AssignCourseOffering, adminUser.ID, fmt.Sprint(class.ID), req, 400)
 	call(CreateAttendanceSession, tu2.ID, "", CreateAttendanceSessionRequest{CourseOfferingID: offering.ID}, 400)
+	t.Run("self profile and password", func(t *testing.T) {
+		for _, uid := range []uint{adminUser.ID, tu.ID} {
+			profilePayload := call(GetOwnProfile, uid, "", nil, 200)
+			var profile models.User
+			json.Unmarshal(profilePayload["data"], &profile)
+			if profile.ID != uid {
+				t.Fatal("profile returned another account")
+			}
+			if bytes.Contains(profilePayload["data"], []byte(`"Password"`)) {
+				t.Fatal("profile leaked password")
+			}
+			call(UpdateOwnProfile, uid, "", map[string]interface{}{"fullName": "Updated Profile", "email": profile.Email, "phone": "0901234567", "address": "Contact address", "roleId": studentRole.ID, "majorId": 999999}, 200)
+			var updated models.User
+			db.First(&updated, uid)
+			if updated.FullName != "Updated Profile" || updated.RoleID != profile.RoleID {
+				t.Fatal("profile did not update name or allowed role change")
+			}
+			if uid == tu.ID {
+				var updatedTeacher models.Teacher
+				db.First(&updatedTeacher, teacher.ID)
+				if updatedTeacher.Phone != "0901234567" || updatedTeacher.MajorID != major.ID {
+					t.Fatal("profile failed contact update or changed teaching major")
+				}
+			}
+			call(UpdateOwnProfile, uid, "", map[string]string{"fullName": "Invalid overwrite", "email": "bad-email"}, 400)
+			oldHash, err := bcrypt.GenerateFromPassword([]byte("OldSecret123"), bcrypt.DefaultCost)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Model(&models.User{}).Where("id = ?", uid).Update("password", string(oldHash))
+			call(ChangeOwnPassword, uid, "", map[string]string{"currentPassword": "wrong", "newPassword": "NewSecret123"}, 400)
+			call(ChangeOwnPassword, uid, "", map[string]string{"currentPassword": "OldSecret123", "newPassword": "short"}, 400)
+			call(ChangeOwnPassword, uid, "", map[string]string{"currentPassword": "OldSecret123", "newPassword": "NewSecret123"}, 200)
+			db.First(&updated, uid)
+			if bcrypt.CompareHashAndPassword([]byte(updated.Password), []byte("NewSecret123")) != nil || updated.FirstLogin {
+				t.Fatal("password update failed")
+			}
+		}
+	})
 	t.Log("PASS: migration, academic periods, reusable class/course, term isolation, today/multi-date schedule, conflicts, student schedule, attendance, grading, transcript, exercises, registration, exams, closed term")
 }

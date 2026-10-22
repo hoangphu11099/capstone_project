@@ -42,6 +42,7 @@ type CreateTeacherRequest struct {
 	Phone         string `json:"phone"`
 	Address       string `json:"address"`
 	Qualification string `json:"qualification"`
+	MajorID       uint   `json:"majorId"`
 }
 
 func CreateTeacher(c *gin.Context) {
@@ -51,6 +52,9 @@ func CreateTeacher(c *gin.Context) {
 		return
 	}
 
+	if !validateTeacherMajor(c, req.MajorID) {
+		return
+	}
 	password := strings.TrimSpace(req.Password)
 	if password == "" {
 		password = "Teacher@123"
@@ -84,7 +88,7 @@ func CreateTeacher(c *gin.Context) {
 		if err := tx.Create(&user).Error; err != nil {
 			return err
 		}
-		teacher = models.Teacher{TeacherCode: code, UserID: user.ID, Phone: strings.TrimSpace(req.Phone), Address: strings.TrimSpace(req.Address), Qualification: strings.TrimSpace(req.Qualification), HireDate: time.Now()}
+		teacher = models.Teacher{TeacherCode: code, UserID: user.ID, MajorID: req.MajorID, Phone: strings.TrimSpace(req.Phone), Address: strings.TrimSpace(req.Address), Qualification: strings.TrimSpace(req.Qualification), HireDate: time.Now()}
 		if err := tx.Create(&teacher).Error; err != nil {
 			return err
 		}
@@ -199,6 +203,14 @@ func CreateStudent(c *gin.Context) {
 func ListStudents(c *gin.Context) {
 	var students []models.Student
 	query := config.DB.Preload("User").Preload("Class")
+	if classID := strings.TrimSpace(c.Query("classId")); classID != "" {
+		id, err := strconv.ParseUint(classID, 10, 64)
+		if err != nil || id == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "ID lớp không hợp lệ"})
+			return
+		}
+		query = query.Where("students.class_id = ?", id)
+	}
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
 		like := "%" + q + "%"
 		query = query.Joins("JOIN users ON users.id = students.user_id").
@@ -259,7 +271,7 @@ func DeleteTeacher(c *gin.Context) {
 
 func ListTeachers(c *gin.Context) {
 	var teachers []models.Teacher
-	query := config.DB.Preload("User")
+	query := config.DB.Preload("User").Preload("Major")
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
 		like := "%" + q + "%"
 		query = query.Joins("JOIN users ON users.id = teachers.user_id").

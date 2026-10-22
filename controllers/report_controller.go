@@ -112,7 +112,7 @@ func countAttendanceByStatus(teacherID uint) map[string]int64 {
 			Joins("JOIN enrollments ON enrollments.id = attendances.enrollment_id").
 			Joins("JOIN classes ON classes.id = enrollments.class_id").
 			Joins("LEFT JOIN course_offerings co ON co.id = enrollments.course_offering_id").
-			Where("attendances.status = ?", status)
+			Where("attendances.status = ?", status).Where("attendances.attendance_session_id IS NULL OR attendances.attendance_session_id IN (SELECT id FROM attendance_sessions WHERE status = ?)", "confirmed")
 		if teacherID > 0 {
 			query = query.Where("COALESCE(co.teacher_id, classes.teacher_id) = ?", teacherID)
 		}

@@ -23,6 +23,9 @@ func UpdateTeacher(c *gin.Context) {
 		c.JSON(400, gin.H{"message": "Vui lòng nhập tên đăng nhập và họ tên"})
 		return
 	}
+	if !validateTeacherMajor(c, req.MajorID) {
+		return
+	}
 	var hash []byte
 	if req.Password != "" {
 		if len(req.Password) < 6 {
@@ -49,7 +52,7 @@ func UpdateTeacher(c *gin.Context) {
 			return errors.New("Không thể cập nhật tài khoản. Kiểm tra tên đăng nhập hoặc email đã tồn tại")
 		}
 		return tx.Model(&models.Teacher{}).Where("id = ?", teacher.ID).Updates(map[string]interface{}{
-			"phone": strings.TrimSpace(req.Phone), "address": strings.TrimSpace(req.Address), "qualification": strings.TrimSpace(req.Qualification),
+			"phone": strings.TrimSpace(req.Phone), "address": strings.TrimSpace(req.Address), "qualification": strings.TrimSpace(req.Qualification), "major_id": req.MajorID,
 		}).Error
 	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -61,4 +64,30 @@ func UpdateTeacher(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"message": "Cập nhật giảng viên thành công"})
+}
+
+func validateTeacherMajor(c *gin.Context, id uint) bool {
+	var major models.Major
+	if id == 0 || config.DB.Where("is_active = ?", true).First(&major, id).Error != nil {
+		c.JSON(400, gin.H{"message": "Vui lòng chọn ngành dạy hợp lệ cho giảng viên"})
+		return false
+	}
+	return true
+}
+
+func CreateMajor(c *gin.Context) {
+	var req struct {
+		Code string `json:"code"`
+		Name string `json:"name"`
+	}
+	if c.ShouldBindJSON(&req) != nil || strings.TrimSpace(req.Code) == "" || strings.TrimSpace(req.Name) == "" {
+		c.JSON(400, gin.H{"message": "Vui lòng nhập mã và tên chuyên ngành"})
+		return
+	}
+	major := models.Major{Code: strings.ToUpper(strings.TrimSpace(req.Code)), Name: strings.TrimSpace(req.Name), IsActive: true}
+	if err := config.DB.Create(&major).Error; err != nil {
+		c.JSON(400, gin.H{"message": "Không tạo được chuyên ngành. Kiểm tra mã chuyên ngành đã tồn tại."})
+		return
+	}
+	c.JSON(201, gin.H{"message": "Tạo chuyên ngành thành công", "data": major})
 }

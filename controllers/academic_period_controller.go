@@ -150,6 +150,10 @@ func SaveSemester(c *gin.Context) {
 func ListAdminCourseOfferings(c *gin.Context) {
 	var rows []models.CourseOffering
 	query := config.DB.Preload("Class").Preload("Course").Preload("Teacher.User").Preload("Semester").Preload("Room").Preload("Schedules")
+	if id := c.Query("classId"); id != "" {
+		query = query.Where("class_id = ?", id)
+	}
+
 	if id := c.Query("semesterId"); id != "" {
 		query = query.Where("semester_id = ?", id)
 	}

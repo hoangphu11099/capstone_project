@@ -71,6 +71,10 @@ func main() {
 	r.GET("/public/home", controllers.GetPublicHome)
 	r.GET("/public/posts", controllers.GetPublicPosts)
 	r.GET("/public/posts/:slug", controllers.GetPublicPost)
+	r.GET("/public/faculty", controllers.ListPublicFaculty)
+	r.GET("/public/program-images", controllers.ListProgramImages)
+	r.GET("/public/programs", controllers.ListPublicPrograms)
+	r.POST("/public/consultations", controllers.CreatePublicConsultation)
 
 	//U-4: Logout
 	r.POST("/logout", middleware.AuthRequired(), controllers.Logout)
@@ -81,6 +85,9 @@ func main() {
 	{
 		// U-2: Change Password
 		auth.POST("/change-password", controllers.ChangePassword)
+		auth.GET("/profile", middleware.RoleRequired("teacher"), controllers.GetOwnProfile)
+		auth.PUT("/profile", middleware.RoleRequired("teacher"), controllers.UpdateOwnProfile)
+		auth.POST("/profile/password", middleware.RoleRequired("teacher"), controllers.ChangeOwnPassword)
 		// U-5: View Schedule
 		auth.GET("/schedule", controllers.ViewSchedule)
 		// U-6: View Transcript
@@ -112,6 +119,14 @@ func main() {
 
 		// PP Academy public website administration.
 		auth.GET("/admin/site-settings", middleware.RoleRequired("admin"), controllers.GetAdminSiteSettings)
+		auth.GET("/admin/consultations", middleware.RoleRequired("admin"), controllers.ListConsultations)
+		auth.GET("/admin/program-images", middleware.RoleRequired("admin"), controllers.ListProgramImages)
+		auth.GET("/admin/programs", middleware.RoleRequired("admin"), controllers.ListPublicPrograms)
+		auth.GET("/admin/faculty", middleware.RoleRequired("admin"), controllers.ListPublicFaculty)
+		auth.PUT("/admin/faculty/:id", middleware.RoleRequired("admin"), controllers.UpdateFacultyProfile)
+		auth.PUT("/admin/programs/:slug", middleware.RoleRequired("admin"), controllers.SavePublicProgram)
+		auth.PUT("/admin/program-images/:slug", middleware.RoleRequired("admin"), controllers.UpdateProgramImage)
+		auth.PUT("/admin/consultations/:id", middleware.RoleRequired("admin"), controllers.UpdateConsultation)
 		auth.PUT("/admin/site-settings", middleware.RoleRequired("admin"), controllers.UpdateAdminSiteSettings)
 		auth.GET("/admin/posts", middleware.RoleRequired("admin"), controllers.ListAdminPosts)
 		auth.POST("/admin/posts", middleware.RoleRequired("admin"), controllers.CreateAdminPost)
@@ -131,11 +146,15 @@ func main() {
 		auth.GET("/rooms", middleware.RoleRequired("admin"), controllers.ListRooms)
 		auth.POST("/rooms", middleware.RoleRequired("admin"), controllers.SaveRoom)
 		auth.PUT("/rooms/:id", middleware.RoleRequired("admin"), controllers.SaveRoom)
+		auth.GET("/students/:id/learning-detail", middleware.RoleRequired("admin"), controllers.StudentLearningDetail)
+		auth.GET("/classes/:id/learning-detail", middleware.RoleRequired("admin"), controllers.AdminClassLearningDetail)
+		auth.GET("/teacher/classes/:id/learning-detail", middleware.RoleRequired("teacher"), controllers.TeacherClassLearningDetail)
 		auth.GET("/students", middleware.RoleRequired("admin"), controllers.ListStudents)
 		auth.POST("/students", middleware.RoleRequired("admin"), controllers.CreateStudent)
 		auth.PUT("/students/:id", middleware.RoleRequired("admin"), controllers.UpdateStudent)
 		auth.DELETE("/students/:id", middleware.RoleRequired("admin"), controllers.DeleteStudent)
 		auth.GET("/teachers", middleware.RoleRequired("admin"), controllers.ListTeachers)
+		auth.POST("/majors", middleware.RoleRequired("admin"), controllers.CreateMajor)
 		auth.POST("/teachers", middleware.RoleRequired("admin"), controllers.CreateTeacher)
 		auth.PUT("/teachers/:id", middleware.RoleRequired("admin"), controllers.UpdateTeacher)
 		auth.DELETE("/teachers/:id", middleware.RoleRequired("admin"), controllers.DeleteTeacher)
@@ -207,6 +226,7 @@ func main() {
 	auth.GET("/attendance/sessions/:id/qr", middleware.RoleRequired("teacher"), controllers.GetAttendanceSessionQRCode)
 	auth.GET("/attendance/sessions/:id/records", middleware.RoleRequired("teacher"), controllers.ListAttendanceSessionRecords)
 	auth.POST("/attendance/sessions/:id/close", middleware.RoleRequired("teacher"), controllers.CloseAttendanceSession)
+	auth.POST("/attendance/sessions/:id/cancel", middleware.RoleRequired("teacher"), controllers.CancelAttendanceSession)
 	auth.PUT("/attendances/:id", middleware.RoleRequired("teacher"), controllers.UpdateAttendanceStatus)
 
 	// TU-03, TU-04: Submit grade + export transcript

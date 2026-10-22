@@ -61,6 +61,15 @@ func ViewSchedule(c *gin.Context) {
 		return
 	}
 
+	exams, examErr := personalExams(student.ID, 0)
+	if examErr != nil {
+		c.JSON(500, gin.H{"message": "Không tải được lịch thi"})
+		return
+	}
+	for _, exam := range exams {
+		day := exam.ExamDate.Format("2006-01-02")
+		schedules = append(schedules, responses.ScheduleResponse{TeachingDate: day, CourseCode: exam.Course.Code, CourseName: "Lịch thi · " + exam.Course.Name, Room: exam.Room.Name, Period: exam.Session + " · " + exam.StartTime + "–" + exam.EndTime + " · " + exam.ExamType, StartDate: day, EndDate: day})
+	}
 	if len(schedules) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{
 			"message": "Bạn chưa đăng ký môn học nào",
@@ -111,7 +120,7 @@ func ViewTeacherSchedule(c *gin.Context) {
 		Joins("JOIN courses c ON c.id = co.course_id").
 		Joins("LEFT JOIN rooms r ON r.id = co.room_id").
 		Joins("JOIN semesters sem ON sem.id = co.semester_id").
-		Where("co.teacher_id = ? AND co.status = ?", teacher.ID, "open").
+		Where("co.teacher_id = ?", teacher.ID).
 		Order("s.full_date, FIELD(s.day_of_week, 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'), s.start_time, cl.class_code, c.code").
 		Scan(&schedules).Error
 	if err != nil {
@@ -119,8 +128,29 @@ func ViewTeacherSchedule(c *gin.Context) {
 		return
 	}
 
+	exams, examErr := personalExams(0, teacher.ID)
+	if examErr != nil {
+		c.JSON(500, gin.H{"message": "Không tải được lịch thi"})
+		return
+	}
+	for _, exam := range exams {
+		day := exam.ExamDate.Format("2006-01-02")
+		schedules = append(schedules, responses.TeacherScheduleResponse{ID: 1000000000 + exam.ID, TeachingDate: day, ClassID: exam.ClassID, ClassCode: exam.Class.ClassCode, CourseCode: exam.Course.Code, CourseName: "Lịch thi · " + exam.Course.Name, RoomName: exam.Room.Name, Session: exam.Session + " · " + exam.ExamType, StartTime: exam.StartTime, EndTime: exam.EndTime, SemesterStartDate: day, SemesterEndDate: day, OfferingStatus: "open"})
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Lấy lịch dạy giảng viên thành công",
 		"data":    schedules,
 	})
+}
+
+func personalExams(studentID, teacherID uint) ([]models.ExamSchedule, error) {
+	var exams []models.ExamSchedule
+	query := config.DB.Model(&models.ExamSchedule{}).Preload("Class").Preload("Course").Preload("Room").Joins("JOIN course_offerings co ON co.class_id = exam_schedules.class_id AND co.course_id = exam_schedules.course_id AND co.semester_id = exam_schedules.semester_id")
+	if teacherID > 0 {
+		query = query.Where("co.teacher_id = ?", teacherID)
+	} else {
+		query = query.Joins("JOIN enrollments e ON e.class_id = co.class_id AND e.course_id = co.course_id AND (e.course_offering_id = co.id OR e.course_offering_id IS NULL)").Where("e.student_id = ? AND e.status <> ?", studentID, "cancelled")
+	}
+	err := query.Distinct("exam_schedules.*").Order("exam_date, start_time").Find(&exams).Error
+	return exams, err
 }

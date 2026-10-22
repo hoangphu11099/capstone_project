@@ -23,6 +23,7 @@ type SiteSetting struct {
 
 // SchoolPost is a news/article shown on the public PP Academy website.
 type SchoolPost struct {
+	Category      string     `gorm:"size:30;default:news" json:"category"`
 	ID            uint       `gorm:"primaryKey" json:"id"`
 	Title         string     `gorm:"size:255;not null" json:"title"`
 	Slug          string     `gorm:"size:255;uniqueIndex;not null" json:"slug"`

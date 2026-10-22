@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,6 +53,7 @@ func CreateExamSchedule(c *gin.Context) {
 		return
 	}
 
+	normalizeExamSession(&req)
 	if err := validateExamOffering(req); err != nil {
 		c.JSON(400, gin.H{"message": err.Error()})
 		return
@@ -85,7 +87,12 @@ func CreateExamSchedule(c *gin.Context) {
 		Note:       strings.TrimSpace(req.Note),
 	}
 
-	if err := config.DB.Create(&exam).Error; err != nil {
+	if err := config.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&exam).Error; err != nil {
+			return err
+		}
+		return notifyExamClass(tx, exam)
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Tạo lịch thi thất bại", "error": err.Error()})
 		return
 	}
@@ -106,6 +113,7 @@ func UpdateExamSchedule(c *gin.Context) {
 		return
 	}
 
+	normalizeExamSession(&req)
 	if err := validateExamOffering(req); err != nil {
 		c.JSON(400, gin.H{"message": err.Error()})
 		return
@@ -147,7 +155,12 @@ func UpdateExamSchedule(c *gin.Context) {
 	exam.ExamType = strings.TrimSpace(req.ExamType)
 	exam.Note = strings.TrimSpace(req.Note)
 
-	if err := config.DB.Save(&exam).Error; err != nil {
+	if err := config.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&exam).Error; err != nil {
+			return err
+		}
+		return notifyExamClass(tx, exam)
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Cập nhật lịch thi thất bại", "error": err.Error()})
 		return
 	}
@@ -195,6 +208,9 @@ func hasClassExam(currentID uint, classID uint, courseID uint, semesterID uint) 
 }
 
 func validateExamOffering(req ExamScheduleRequest) error {
+	if req.Session != "Sáng" && req.Session != "Chiều" && req.Session != "Tối" {
+		return errors.New("Ca thi chỉ gồm Sáng, Trưa / Chiều, Tối")
+	}
 	var offering models.CourseOffering
 	if err := config.DB.Preload("Semester").Where("class_id = ? AND course_id = ? AND semester_id = ?", req.ClassID, req.CourseID, req.SemesterID).First(&offering).Error; err != nil {
 		return errors.New("Môn chưa được mở cho lớp trong học kỳ đã chọn")
@@ -209,6 +225,52 @@ func validateExamOffering(req ExamScheduleRequest) error {
 	}
 	if timeToMinutes(req.StartTime) < 0 || timeToMinutes(req.EndTime) <= timeToMinutes(req.StartTime) {
 		return errors.New("Giờ thi không hợp lệ")
+	}
+	return nil
+}
+
+func normalizeExamSession(req *ExamScheduleRequest) {
+	switch strings.TrimSpace(req.Session) {
+	case "AM", "Sáng":
+		req.Session = "Sáng"
+		req.StartTime = "07:30"
+		req.EndTime = "11:30"
+	case "PM", "Trưa", "Chiều":
+		req.Session = "Chiều"
+		req.StartTime = "13:30"
+		req.EndTime = "16:30"
+	case "Tối":
+		req.Session = "Tối"
+		req.StartTime = "18:00"
+		req.EndTime = "21:00"
+	}
+	if strings.TrimSpace(req.ExamType) == "" {
+		req.ExamType = "Trực tiếp"
+	}
+}
+
+func notifyExamClass(tx *gorm.DB, exam models.ExamSchedule) error {
+	var offering models.CourseOffering
+	if err := tx.Preload("Course").Preload("Class").Preload("Teacher").Where("class_id = ? AND course_id = ? AND semester_id = ?", exam.ClassID, exam.CourseID, exam.SemesterID).First(&offering).Error; err != nil {
+		return err
+	}
+	var students []models.Student
+	if err := tx.Joins("JOIN enrollments e ON e.student_id = students.id").Where("e.class_id = ? AND e.course_id = ? AND e.status <> ? AND (e.course_offering_id = ? OR e.course_offering_id IS NULL)", exam.ClassID, exam.CourseID, "cancelled", offering.ID).Distinct("students.*").Find(&students).Error; err != nil {
+		return err
+	}
+	users := map[uint]bool{offering.Teacher.UserID: true}
+	for _, student := range students {
+		users[student.UserID] = true
+	}
+	for userID := range users {
+		if userID == 0 {
+			continue
+		}
+		recipient := userID
+		notification := models.Notification{RecipientUserID: &recipient, Subject: "Lịch thi · " + offering.Course.Name, Content: fmt.Sprintf("Lớp %s · %s: thi ngày %s, ca %s (%s–%s), hình thức %s. %s", offering.Class.ClassCode, offering.Course.Name, exam.ExamDate.Format("02/01/2006"), exam.Session, exam.StartTime, exam.EndTime, exam.ExamType, exam.Note), TargetType: "user", Channel: "app", Status: "created"}
+		if err := tx.Create(&notification).Error; err != nil {
+			return err
+		}
 	}
 	return nil
 }

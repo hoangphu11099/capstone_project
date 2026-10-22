@@ -94,6 +94,9 @@ func AutoMigrateDB() {
 		&models.GradeApproval{},
 		&models.SiteSetting{},
 		&models.SchoolPost{},
+		&models.Consultation{},
+		&models.ProgramImage{},
+		&models.PublicProgram{},
 	); err != nil {
 		log.Fatal("Failed to migrate database:", err)
 	}

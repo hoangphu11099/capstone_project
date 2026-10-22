@@ -9,6 +9,14 @@ type ClassOffer struct {
 	ClassID uint
 	Class   Class `gorm:"foreignKey:ClassID"`
 
+	CourseID   *uint
+	Course     Course `gorm:"foreignKey:CourseID"`
+	SemesterID *uint
+	Semester   Semester `gorm:"foreignKey:SemesterID"`
+	RoomID     *uint
+	Room       Room   `gorm:"foreignKey:RoomID"`
+	PlanJSON   string `gorm:"type:longtext"`
+
 	TeacherID uint
 	Teacher   Teacher `gorm:"foreignKey:TeacherID"`
 

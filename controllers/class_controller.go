@@ -61,7 +61,9 @@ func ListClasses(c *gin.Context) {
 		Preload("Major").
 		Preload("Teacher.User").
 		Preload("Room").
-		Preload("Semester")
+		Preload("Semester").
+		Preload("CourseOfferings.Schedules").
+		Preload("CourseOfferings.Semester")
 
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
 		query = query.Where("classes.class_code LIKE ?", "%"+q+"%")
@@ -80,7 +82,7 @@ func ListClasses(c *gin.Context) {
 	}
 
 	if err := query.
-		Order("classes.class_code").
+		Order("classes.id DESC").
 		Find(&classes).Error; err != nil {
 
 		c.JSON(http.StatusInternalServerError, gin.H{

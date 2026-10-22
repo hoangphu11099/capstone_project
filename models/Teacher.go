@@ -10,6 +10,8 @@ type Teacher struct {
 	Phone         string
 	Address       string
 	Qualification string
+	Biography     string `gorm:"type:text"`
+	AvatarURL     string `gorm:"size:2048"`
 	HireDate      time.Time
 	MajorID       uint  `gorm:"default:null"`
 	Major         Major `gorm:"foreignKey:MajorID"`

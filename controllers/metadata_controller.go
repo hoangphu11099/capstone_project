@@ -40,11 +40,11 @@ func GetMetadata(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi lấy danh sách môn học", "error": err.Error()})
 		return
 	}
-	if err := config.DB.Preload("User").Order("teacher_code").Find(&teachers).Error; err != nil {
+	if err := config.DB.Preload("User").Preload("Major").Order("teacher_code").Find(&teachers).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi lấy danh sách giảng viên", "error": err.Error()})
 		return
 	}
-	if err := config.DB.Preload("Major").Preload("Teacher.User").Preload("Room").Preload("Semester").Order("class_code").Find(&classes).Error; err != nil {
+	if err := config.DB.Preload("Major").Preload("Teacher.User").Preload("Room").Preload("Semester").Order("id DESC").Find(&classes).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi lấy danh sách lớp", "error": err.Error()})
 		return
 	}

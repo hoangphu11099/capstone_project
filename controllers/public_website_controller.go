@@ -33,6 +33,7 @@ type siteSettingRequest struct {
 }
 
 type schoolPostRequest struct {
+	Category      string `json:"category"`
 	Title         string `json:"title"`
 	Excerpt       string `json:"excerpt"`
 	Content       string `json:"content"`
@@ -214,7 +215,7 @@ func CreateAdminPost(c *gin.Context) {
 	post := models.SchoolPost{
 		Title: strings.TrimSpace(req.Title), Slug: uniquePostSlug(slugify(req.Title), 0), Excerpt: strings.TrimSpace(req.Excerpt),
 		Content: strings.TrimSpace(req.Content), CoverImageURL: strings.TrimSpace(req.CoverImageURL), AuthorName: defaultAuthor(req.AuthorName),
-		IsPublished: req.IsPublished, IsFeatured: req.IsFeatured,
+		IsPublished: req.IsPublished, IsFeatured: req.IsFeatured, Category: normalizePostCategory(req.Category),
 	}
 	if post.IsPublished {
 		post.PublishedAt = &now
@@ -261,6 +262,7 @@ func UpdateAdminPost(c *gin.Context) {
 	post.AuthorName = defaultAuthor(req.AuthorName)
 	post.IsPublished = req.IsPublished
 	post.IsFeatured = req.IsFeatured
+	post.Category = normalizePostCategory(req.Category)
 	if err := config.DB.Save(&post).Error; err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Không cập nhật được bài viết", "error": err.Error()})
 		return
@@ -286,7 +288,17 @@ func DeleteAdminPost(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Đã xóa bài viết"})
 }
 
+func normalizePostCategory(value string) string {
+	if value == "student" {
+		return "student"
+	}
+	return "news"
+}
+
 func validatePostRequest(req schoolPostRequest) string {
+	if req.Category != "" && req.Category != "news" && req.Category != "student" {
+		return "Chuyên mục không hợp lệ"
+	}
 	if strings.TrimSpace(req.Title) == "" {
 		return "Tiêu đề không được để trống"
 	}

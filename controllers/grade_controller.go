@@ -32,13 +32,13 @@ func ListTeacherClasses(c *gin.Context) {
 	var classes []models.Class
 	if err := config.DB.Preload("Major").Preload("Room").Preload("Semester").
 		Preload("Schedules").
-		Preload("CourseOfferings", "teacher_id = ? AND status = ?", teacher.ID, "open").
+		Preload("CourseOfferings", "teacher_id = ?", teacher.ID).
 		Preload("CourseOfferings.Course").
 		Preload("CourseOfferings.Room").
 		Preload("CourseOfferings.Semester").
 		Preload("CourseOfferings.Schedules").
 		Joins("JOIN course_offerings ON course_offerings.class_id = classes.id").
-		Where("course_offerings.teacher_id = ? AND course_offerings.status = ?", teacher.ID, "open").
+		Where("course_offerings.teacher_id = ?", teacher.ID).
 		Distinct("classes.*").
 		Order("class_code").
 		Find(&classes).Error; err != nil {
