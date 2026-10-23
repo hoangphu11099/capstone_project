@@ -817,5 +817,61 @@ func TestAcademicFlowIntegration(t *testing.T) {
 			}
 		}
 	})
-	t.Log("PASS: migration, academic periods, reusable class/course, term isolation, today/multi-date schedule, conflicts, student schedule, attendance, grading, transcript, exercises, registration, exams, closed term")
+	t.Run("academic warning delivery", func(t *testing.T) {
+		warningUser := user("warning_student", studentRole.ID)
+		warningStudent := models.Student{UserID: warningUser.ID, StudentCode: "WARN1", ClassID: class.ID, DateOfBirth: now.AddDate(-20, 0, 0), EnrollmentDate: now}
+		create(&warningStudent)
+		var ids []uint
+		for i := 0; i < 2; i++ {
+			warningCourse := models.Course{Code: fmt.Sprintf("WARN%d", i), Name: fmt.Sprintf("Warning course %d", i), MajorID: major.ID}
+			create(&warningCourse)
+			warningOffering := models.CourseOffering{ClassID: class.ID, CourseID: warningCourse.ID, TeacherID: teacher.ID, SemesterID: term.ID, RoomID: room.ID}
+			create(&warningOffering)
+			enrollment := models.Enrollment{StudentID: warningStudent.ID, ClassID: class.ID, CourseID: warningCourse.ID, CourseOfferingID: &warningOffering.ID, EnrollDate: now}
+			create(&enrollment)
+			create(&models.Grade{EnrollmentID: enrollment.ID, TotalScore: 30, Status: "Approved"})
+			create(&models.Attendance{EnrollmentID: enrollment.ID, ClassDate: now.AddDate(0, 0, -1), Status: "absent"})
+			ids = append(ids, enrollment.ID)
+		}
+		rows, err := loadWarningCandidates(db, term.ID, class.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := 0
+		for _, row := range rows {
+			if row.StudentID == warningStudent.ID {
+				found++
+				if !candidateHasReason(row, "failed_course") || !candidateHasReason(row, "unexcused") {
+					t.Fatalf("missing violation: %+v", row)
+				}
+			}
+		}
+		if found != 2 {
+			t.Fatalf("expected two warning rows, got %d", found)
+		}
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": term.ID, "classId": class.ID, "reason": "all", "enrollmentIds": ids}, 201)
+		var notices []models.Notification
+		db.Where("recipient_user_id = ? AND target_type = ?", warningUser.ID, "academic_warning").Find(&notices)
+		if len(notices) != 1 || !strings.Contains(notices[0].Content, "Warning course 0") || !strings.Contains(notices[0].Content, "Warning course 1") || notices[0].Channel != "app" || notices[0].SentAt == nil {
+			t.Fatalf("warnings were not grouped/delivered: %+v", notices)
+		}
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": previous.ID, "reason": "all", "enrollmentIds": ids}, 409)
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": term.ID, "reason": "absence_limit", "enrollmentIds": ids}, 409)
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": term.ID, "reason": "unknown", "enrollmentIds": ids}, 400)
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": term.ID, "reason": "all"}, 400)
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": term.ID, "classId": class.ID, "reason": "failed_course", "enrollmentIds": ids[:1]}, 201)
+		db.Where("recipient_user_id = ? AND target_type = ?", warningUser.ID, "academic_warning").Order("id").Find(&notices)
+		if len(notices) != 2 || strings.Contains(notices[1].Content, "Nghỉ không phép") || strings.Contains(notices[1].Content, "Warning course 1") {
+			t.Fatal("selected reason or enrollment scope was ignored")
+		}
+		// All matching recipients are delivered atomically; inactive accounts cannot silently drop out.
+		db.Model(&warningUser).Update("is_active", false)
+		call(SendAcademicWarnings, adminUser.ID, "", map[string]any{"semesterId": term.ID, "classId": class.ID, "reason": "failed_course", "all": true}, 500)
+		var count int64
+		db.Model(&models.Notification{}).Where("recipient_user_id = ? AND target_type = ?", warningUser.ID, "academic_warning").Count(&count)
+		if count != 2 {
+			t.Fatal("failed send partially saved notifications")
+		}
+	})
+	t.Log("PASS: migration, academic periods, reusable class/course, term isolation, today/multi-date schedule, conflicts, student schedule, attendance, grading, transcript, exercises, registration, exams, closed term, academic warnings")
 }

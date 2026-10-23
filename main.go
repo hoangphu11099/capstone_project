@@ -193,6 +193,8 @@ func main() {
 
 		// U-23: Academic Warning
 		auth.GET("/academic-warnings", middleware.RoleRequired("admin"), controllers.ListAcademicWarnings)
+		auth.GET("/academic-warnings/candidates", middleware.RoleRequired("admin"), controllers.ListAcademicWarningCandidates)
+		auth.POST("/academic-warnings/send", middleware.RoleRequired("admin"), controllers.SendAcademicWarnings)
 		auth.POST("/academic-warnings/generate", middleware.RoleRequired("admin"), controllers.GenerateAcademicWarnings)
 		auth.DELETE("/academic-warnings/:id", middleware.RoleRequired("admin"), controllers.DeleteAcademicWarning)
 
