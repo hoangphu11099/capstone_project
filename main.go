@@ -85,8 +85,8 @@ func main() {
 	{
 		// U-2: Change Password
 		auth.POST("/change-password", controllers.ChangePassword)
-		auth.GET("/profile", middleware.RoleRequired("teacher"), controllers.GetOwnProfile)
-		auth.PUT("/profile", middleware.RoleRequired("teacher"), controllers.UpdateOwnProfile)
+		auth.GET("/profile", controllers.GetOwnProfile)
+		auth.PUT("/profile", controllers.UpdateOwnProfile)
 		auth.POST("/profile/password", middleware.RoleRequired("teacher"), controllers.ChangeOwnPassword)
 		// U-5: View Schedule
 		auth.GET("/schedule", controllers.ViewSchedule)
@@ -95,6 +95,10 @@ func main() {
 		// U-07: Register Courses
 		auth.GET("/course-classes/open", middleware.RoleRequired("student"), controllers.ListOpenCourseClasses)
 		auth.POST("/course-registrations", middleware.RoleRequired("student"), controllers.RegisterCourse)
+		auth.DELETE("/course-registration-requests/:id", middleware.RoleRequired("student"), controllers.CancelPendingRegistration)
+		auth.GET("/admin/course-registrations", middleware.RoleRequired("admin"), controllers.ListAdminCourseRegistrations)
+		auth.PUT("/admin/course-registrations/:id/confirm-payment", middleware.RoleRequired("admin"), controllers.ConfirmRegistrationPayment)
+		auth.PUT("/admin/course-registrations/:id/schedule", middleware.RoleRequired("admin"), controllers.ScheduleCourseRegistration)
 
 		// U-08: Create Class
 		auth.GET("/classes", middleware.RoleRequired("admin"), controllers.ListClasses)

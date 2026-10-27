@@ -31,7 +31,12 @@ func ViewSchedule(c *gin.Context) {
 	var schedules []responses.ScheduleResponse
 	err := config.DB.Table("enrollments e").
 		Select(`
-			c.code AS course_code,
+			s.id,
+            cl.class_code,
+            r.building,
+            s.start_time,
+            s.end_time,
+            c.code AS course_code,
 			c.name AS course_name,
 			u.full_name AS teacher_name,
 			r.name AS room,
@@ -68,7 +73,7 @@ func ViewSchedule(c *gin.Context) {
 	}
 	for _, exam := range exams {
 		day := exam.ExamDate.Format("2006-01-02")
-		schedules = append(schedules, responses.ScheduleResponse{TeachingDate: day, CourseCode: exam.Course.Code, CourseName: "Lịch thi · " + exam.Course.Name, Room: exam.Room.Name, Period: exam.Session + " · " + exam.StartTime + "–" + exam.EndTime + " · " + exam.ExamType, StartDate: day, EndDate: day})
+		schedules = append(schedules, responses.ScheduleResponse{TeachingDate: day, CourseCode: exam.Course.Code, CourseName: "Lịch thi · " + exam.Course.Name, Room: exam.Room.Name, StartTime: exam.StartTime, EndTime: exam.EndTime, ClassCode: exam.Class.ClassCode, Period: exam.Session + " · " + exam.StartTime + "–" + exam.EndTime + " · " + exam.ExamType, StartDate: day, EndDate: day})
 	}
 	if len(schedules) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{

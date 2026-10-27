@@ -1,6 +1,11 @@
 package responses
 
 type ScheduleResponse struct {
+	ID           uint   `json:"id"`
+	ClassCode    string `json:"classCode"`
+	Building     string `json:"building"`
+	StartTime    string `json:"startTime"`
+	EndTime      string `json:"endTime"`
 	TeachingDate string `json:"teachingDate"`
 	CourseCode   string `json:"courseCode"`
 	CourseName   string `json:"courseName"`

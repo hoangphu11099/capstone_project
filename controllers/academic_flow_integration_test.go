@@ -228,6 +228,13 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	if len(scheduleRows) != 3 {
 		t.Fatalf("student schedule cross joined courses: %d", len(scheduleRows))
 	}
+	for _, row := range scheduleRows {
+		for _, field := range []string{"courseName", "classCode", "teacherName", "room", "startTime", "endTime"} {
+			if row[field] == nil || row[field] == "" {
+				t.Fatalf("student schedule missing %s: %+v", field, row)
+			}
+		}
+	}
 	payload = call(CreateAttendanceSession, tu2.ID, "", CreateAttendanceSessionRequest{CourseOfferingID: offering.ID}, 200)
 	var attendanceSession models.AttendanceSession
 	json.Unmarshal(payload["data"], &attendanceSession)
@@ -272,6 +279,13 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	var grade models.Grade
 	db.Where("enrollment_id = ?", enrollment.ID).First(&grade)
 	call(ApproveGrade, tu2.ID, fmt.Sprint(grade.ID), nil, 200)
+	transcriptPayload := call(ViewTranscript, su.ID, "", nil, 200)
+	var detailedGrades []map[string]any
+	json.Unmarshal(transcriptPayload["transcript"], &detailedGrades)
+	if len(detailedGrades) != 1 || detailedGrades[0]["teacherName"] != tu2.FullName || detailedGrades[0]["startDate"] == "" || detailedGrades[0]["endDate"] == "" || detailedGrades[0]["assignmentScore"] != float64(80) {
+		t.Fatalf("incomplete transcript details: %+v", detailedGrades)
+	}
+
 	for _, endpoint := range []struct {
 		handler     gin.HandlerFunc
 		id          uint
@@ -350,6 +364,49 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	call(RegisterCourse, su2.ID, "", RegisterCourseRequest{CourseOfferingID: oldOffering.ID}, 201)
 	call(RegisterCourse, su2.ID, "", RegisterCourseRequest{CourseOfferingID: offering.ID}, 201)
 	call(RegisterCourse, su2.ID, "", RegisterCourseRequest{CourseOfferingID: offering.ID}, 400)
+	var pendingRegistration models.CourseRegistration
+	if err := db.Where("student_id = ? AND course_offering_id = ?", student2.ID, offering.ID).First(&pendingRegistration).Error; err != nil {
+		t.Fatal(err)
+	}
+	var unpaidEnrollments int64
+	db.Model(&models.Enrollment{}).Where("student_id = ?", student2.ID).Count(&unpaidEnrollments)
+	if unpaidEnrollments != 0 || pendingRegistration.Status != "pending_payment" {
+		t.Fatal("unpaid registration created an enrollment")
+	}
+	call(ScheduleCourseRegistration, adminUser.ID, fmt.Sprint(pendingRegistration.ID), ScheduleRegistrationRequest{CourseOfferingID: offering.ID}, 400)
+	// Routine class schedule updates must never bypass the tuition gate.
+	if err := db.Transaction(func(tx *gorm.DB) error { return ensureEnrollment(tx, student2.ID, offering) }); err != nil {
+		t.Fatal(err)
+	}
+	db.Model(&models.Enrollment{}).Where("student_id = ?", student2.ID).Count(&unpaidEnrollments)
+	if unpaidEnrollments != 0 {
+		t.Fatal("class sync bypassed pending tuition")
+	}
+	call(ListAdminCourseRegistrations, adminUser.ID, "", nil, 200)
+	paymentResult := call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(pendingRegistration.ID), nil, 200)
+	var confirmedPayment models.CourseRegistration
+	json.Unmarshal(paymentResult["data"], &confirmedPayment)
+	if confirmedPayment.Status != "paid" || confirmedPayment.PaymentConfirmedAt == nil {
+		t.Fatal("payment response must include saved status and audit")
+	}
+
+	call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(pendingRegistration.ID), nil, 200)
+	db.First(&pendingRegistration, pendingRegistration.ID)
+	if pendingRegistration.PaymentConfirmedAt == nil || pendingRegistration.PaymentConfirmedBy == nil || *pendingRegistration.PaymentConfirmedBy != adminUser.ID {
+		t.Fatal("missing payment audit")
+	}
+	call(CancelPendingRegistration, su2.ID, fmt.Sprint(pendingRegistration.ID), nil, 400)
+	call(ScheduleCourseRegistration, adminUser.ID, fmt.Sprint(pendingRegistration.ID), ScheduleRegistrationRequest{CourseOfferingID: offering.ID}, 200)
+	call(ScheduleCourseRegistration, adminUser.ID, fmt.Sprint(pendingRegistration.ID), ScheduleRegistrationRequest{CourseOfferingID: offering.ID}, 200)
+	db.Model(&models.Enrollment{}).Where("student_id = ? AND course_offering_id = ?", student2.ID, offering.ID).Count(&unpaidEnrollments)
+	if unpaidEnrollments != 1 {
+		t.Fatal("scheduling must create exactly one enrollment")
+	}
+	db.First(&pendingRegistration, pendingRegistration.ID)
+	if pendingRegistration.Status != "scheduled" || pendingRegistration.EnrollmentID == nil {
+		t.Fatal("scheduled registration missing enrollment")
+	}
+
 	payload = call(ViewStatisticalReport, tu2.ID, "", nil, 200)
 	var teacherReport struct {
 		TotalEnrollments int `json:"totalEnrollments"`
@@ -377,7 +434,9 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	}
 	var cancelled models.Enrollment
 	db.Where("student_id = ? AND course_offering_id = ?", student2.ID, offering.ID).First(&cancelled)
-	call(CancelCourseRegistration, su2.ID, fmt.Sprint(cancelled.ID), nil, 200)
+	call(CancelCourseRegistration, su2.ID, fmt.Sprint(cancelled.ID), nil, 400)
+	// A cancelled academic-office record must not be reactivated by class sync.
+	db.Model(&cancelled).Update("status", "cancelled")
 	call(AssignCourseOffering, adminUser.ID, fmt.Sprint(class.ID), req, 200)
 	db.First(&cancelled, cancelled.ID)
 	if cancelled.Status != "cancelled" {
@@ -873,5 +932,195 @@ func TestAcademicFlowIntegration(t *testing.T) {
 			t.Fatal("failed send partially saved notifications")
 		}
 	})
-	t.Log("PASS: migration, academic periods, reusable class/course, term isolation, today/multi-date schedule, conflicts, student schedule, attendance, grading, transcript, exercises, registration, exams, closed term, academic warnings")
+	t.Run("mobile self-service profile", func(t *testing.T) {
+		var adminBefore models.User
+		db.First(&adminBefore, adminUser.ID)
+		profileUser := user("mobile-profile", studentRole.ID)
+		profileStudent := models.Student{UserID: profileUser.ID, StudentCode: "MOBILE-PROFILE", ClassID: class.ID, EnrollmentDate: now}
+		create(&profileStudent)
+		body := map[string]any{"fullName": "Mobile Student", "email": "mobile-profile-new@example.test", "phone": "0901234567", "address": "Updated address", "id": adminUser.ID, "roleId": adminRole.ID}
+		call(UpdateOwnProfile, profileUser.ID, "", body, 200)
+		payload := call(GetOwnProfile, profileUser.ID, "", nil, 200)
+		var profile models.User
+		if err := json.Unmarshal(payload["data"], &profile); err != nil {
+			t.Fatal(err)
+		}
+		if profile.ID != profileUser.ID || profile.RoleID != studentRole.ID || profile.FullName != "Mobile Student" || profile.Student == nil || profile.Student.Phone != "0901234567" || profile.Student.ClassID != class.ID {
+			t.Fatalf("profile update changed protected fields or omitted contact data: %+v", profile)
+		}
+		var adminAfter models.User
+		db.First(&adminAfter, adminUser.ID)
+		if adminAfter.FullName != adminBefore.FullName || adminAfter.Email != adminBefore.Email {
+			t.Fatal("self-service profile changed another account")
+		}
+		call(UpdateOwnProfile, profileUser.ID, "", map[string]any{"fullName": "Invalid", "email": "invalid"}, 400)
+		call(UpdateOwnProfile, profileUser.ID, "", map[string]any{"fullName": "Duplicate", "email": adminBefore.Email, "phone": "changed"}, 400)
+		db.First(&profileStudent, profileStudent.ID)
+		if profileStudent.Phone != "0901234567" {
+			t.Fatal("failed profile update partially modified student contact")
+		}
+	})
+	t.Run("pending registration without schedule and reserved capacity", func(t *testing.T) {
+		regClass := models.Class{ClassCode: "REGISTRATION-QUEUE", MajorID: major.ID, MaxStudents: 1, Status: "open"}
+		create(&regClass)
+		regTerm := models.Semester{Name: "Registration queue term", AcademicYearID: &year.ID, StartDate: now, EndDate: now.AddDate(0, 0, 30), Status: "active"}
+		create(&regTerm)
+		regCourse := models.Course{Code: "REG-COURSE", Name: "Registration queue course", MajorID: major.ID, Credits: 3}
+		create(&regCourse)
+		regOffering := models.CourseOffering{CourseID: regCourse.ID, ClassID: regClass.ID, SemesterID: regTerm.ID, TeacherID: teacher.ID, RoomID: room.ID, Status: "open"}
+		create(&regOffering)
+		firstUser := user("queue-first", studentRole.ID)
+		secondUser := user("queue-second", studentRole.ID)
+		first := models.Student{UserID: firstUser.ID, StudentCode: "QUEUE1", ClassID: regClass.ID, EnrollmentDate: now, DateOfBirth: now.AddDate(-20, 0, 0)}
+		create(&first)
+		second := models.Student{UserID: secondUser.ID, StudentCode: "QUEUE2", ClassID: regClass.ID, EnrollmentDate: now, DateOfBirth: now.AddDate(-20, 0, 0)}
+		create(&second)
+		call(RegisterCourse, firstUser.ID, "", RegisterCourseRequest{CourseOfferingID: regOffering.ID}, 201)
+		call(RegisterCourse, secondUser.ID, "", RegisterCourseRequest{CourseOfferingID: regOffering.ID}, 400)
+		var queued models.CourseRegistration
+		db.Where("student_id = ?", first.ID).First(&queued)
+		call(CancelPendingRegistration, secondUser.ID, fmt.Sprint(queued.ID), nil, 400)
+		call(CancelPendingRegistration, firstUser.ID, fmt.Sprint(queued.ID), nil, 200)
+		call(RegisterCourse, secondUser.ID, "", RegisterCourseRequest{CourseOfferingID: regOffering.ID}, 201)
+		// Reset primary key before loading another student's request.
+		queued = models.CourseRegistration{}
+		db.Where("student_id = ?", second.ID).First(&queued)
+		call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(queued.ID), nil, 200)
+		call(ScheduleCourseRegistration, adminUser.ID, fmt.Sprint(queued.ID), ScheduleRegistrationRequest{CourseOfferingID: regOffering.ID}, 400)
+		var count int64
+		db.Model(&models.Enrollment{}).Where("student_id = ?", second.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("missing timetable still created an enrollment")
+		}
+		queueTeacherUser := user("queue-teacher", teacherRole.ID)
+		queueTeacher := models.Teacher{UserID: queueTeacherUser.ID, TeacherCode: "QUEUE-TEACHER", MajorID: major.ID, HireDate: now}
+		create(&queueTeacher)
+		queueRoom := models.Room{Name: "QUEUE-ROOM", Capacity: 5}
+		create(&queueRoom)
+		assignment := AssignCourseOfferingRequest{TeacherID: queueTeacher.ID, RoomID: queueRoom.ID, TeachingDates: []string{day(now.AddDate(0, 0, 1))}, StartTime: "09:00", EndTime: "10:00"}
+		call(ScheduleCourseRegistration, adminUser.ID, fmt.Sprint(queued.ID), ScheduleRegistrationRequest{CourseOfferingID: regOffering.ID, Assignment: &assignment}, 200)
+		db.Model(&models.Enrollment{}).Where("student_id = ?", second.ID).Count(&count)
+		if count != 1 {
+			t.Fatal("admin scheduling did not enroll paid student")
+		}
+		db.Model(&models.Enrollment{}).Where("student_id = ?", first.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("class scheduling enrolled a cancelled unpaid request")
+		}
+		conflictClass := models.Class{ClassCode: "REGISTRATION-CONFLICT", MajorID: major.ID, MaxStudents: 5, Status: "open"}
+		create(&conflictClass)
+		conflictCourse := models.Course{Code: "REG-CONFLICT", Name: "Conflicting registration", MajorID: major.ID, Credits: 2}
+		create(&conflictCourse)
+		conflictOffering := models.CourseOffering{CourseID: conflictCourse.ID, ClassID: conflictClass.ID, SemesterID: regTerm.ID, TeacherID: teacher2.ID, RoomID: room2.ID, Status: "open"}
+		create(&conflictOffering)
+		call(RegisterCourse, secondUser.ID, "", RegisterCourseRequest{CourseOfferingID: conflictOffering.ID}, 201)
+		conflictRequest := models.CourseRegistration{}
+		db.Where("student_id = ? AND course_offering_id = ?", second.ID, conflictOffering.ID).First(&conflictRequest)
+		call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(conflictRequest.ID), nil, 200)
+		conflictAssignment := assignment
+		conflictAssignment.TeacherID = teacher2.ID
+		conflictAssignment.RoomID = room2.ID
+		call(ScheduleCourseRegistration, adminUser.ID, fmt.Sprint(conflictRequest.ID), ScheduleRegistrationRequest{CourseOfferingID: conflictOffering.ID, Assignment: &conflictAssignment}, 400)
+		db.Model(&models.Schedule{}).Where("course_offering_id = ?", conflictOffering.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("failed student conflict check partially saved class schedule")
+		}
+		db.Model(&models.Enrollment{}).Where("student_id = ? AND course_offering_id = ?", second.ID, conflictOffering.ID).Count(&count)
+		if count != 0 {
+			t.Fatal("conflicting schedule enrolled student")
+		}
+
+	})
+
+	t.Run("legacy payment confirmation preserves existing academic history", func(t *testing.T) {
+		legacy := models.CourseRegistration{StudentID: student.ID, CourseID: course.ID, ClassID: class.ID, EnrollmentID: &enrollment.ID, Status: "registered", RegisteredAt: now}
+		create(&legacy)
+		var beforeEnrollments, beforeGrades, beforeSchedules int64
+		db.Model(&models.Enrollment{}).Count(&beforeEnrollments)
+		db.Model(&models.Grade{}).Count(&beforeGrades)
+		db.Model(&models.Schedule{}).Count(&beforeSchedules)
+		legacyResult := call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(legacy.ID), nil, 200)
+		var legacyResponse models.CourseRegistration
+		json.Unmarshal(legacyResult["data"], &legacyResponse)
+		if legacyResponse.Status != "scheduled" || legacyResponse.PaymentConfirmedAt == nil {
+			t.Fatal("legacy response must match saved status")
+		}
+
+		db.First(&legacy, legacy.ID)
+		if legacy.Status != "scheduled" || legacy.CourseOfferingID == nil || *legacy.CourseOfferingID != offering.ID || legacy.PaymentConfirmedAt == nil {
+			t.Fatalf("legacy payment not linked to exact offering: %+v", legacy)
+		}
+		firstConfirmed := *legacy.PaymentConfirmedAt
+		call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(legacy.ID), nil, 200)
+		db.First(&legacy, legacy.ID)
+		if !legacy.PaymentConfirmedAt.Equal(firstConfirmed) {
+			t.Fatal("repeat confirmation replaced original payment audit")
+		}
+		var after int64
+		db.Model(&models.Enrollment{}).Count(&after)
+		if after != beforeEnrollments {
+			t.Fatal("legacy payment created an enrollment")
+		}
+		db.Model(&models.Grade{}).Count(&after)
+		if after != beforeGrades {
+			t.Fatal("legacy payment changed grades")
+		}
+		db.Model(&models.Schedule{}).Count(&after)
+		if after != beforeSchedules {
+			t.Fatal("legacy payment changed timetable")
+		}
+	})
+
+	t.Run("student registrations restricted to current major", func(t *testing.T) {
+		scopeTerm := models.Semester{Name: "Major filter term", AcademicYearID: &year.ID, StartDate: now, EndDate: now.AddDate(0, 0, 30), Status: "active"}
+		create(&scopeTerm)
+		otherMajor := models.Major{Code: "REG-OTHER", Name: "Other registration major"}
+		create(&otherMajor)
+		sameMajorClass := models.Class{ClassCode: "REG-SAME-MAJOR", MajorID: major.ID, MaxStudents: 30, Status: "open"}
+		create(&sameMajorClass)
+		otherClass := models.Class{ClassCode: "REG-OTHER-MAJOR", MajorID: otherMajor.ID, MaxStudents: 30, Status: "open"}
+		create(&otherClass)
+		sameCourse := models.Course{Code: "REG-MAJOR-A", Name: "Same major elective", MajorID: major.ID, Credits: 3}
+		create(&sameCourse)
+		otherCourse := models.Course{Code: "REG-MAJOR-B", Name: "Other major elective", MajorID: otherMajor.ID, Credits: 3}
+		create(&otherCourse)
+		allowed := models.CourseOffering{ClassID: sameMajorClass.ID, CourseID: sameCourse.ID, SemesterID: scopeTerm.ID, TeacherID: teacher.ID, RoomID: room.ID, Status: "open"}
+		create(&allowed)
+		denied := models.CourseOffering{ClassID: otherClass.ID, CourseID: otherCourse.ID, SemesterID: scopeTerm.ID, TeacherID: teacher.ID, RoomID: room.ID, Status: "open"}
+		create(&denied)
+		inconsistent := models.CourseOffering{ClassID: sameMajorClass.ID, CourseID: otherCourse.ID, SemesterID: scopeTerm.ID, TeacherID: teacher.ID, RoomID: room.ID, Status: "open"}
+		create(&inconsistent)
+		result := call(ListOpenCourseClasses, su.ID, "", nil, 200)
+		var visible []OpenCourseClassResponse
+		json.Unmarshal(result["data"], &visible)
+		found := false
+		for _, row := range visible {
+			if row.MajorID != major.ID || row.CourseOfferingID == denied.ID || row.CourseOfferingID == inconsistent.ID {
+				t.Fatal("other-major offering leaked into student catalog")
+			}
+			if row.CourseOfferingID == allowed.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("same-major elective from another class was hidden")
+		}
+		designUser := user("major-filter-student", studentRole.ID)
+		designStudent := models.Student{UserID: designUser.ID, StudentCode: "MAJOR-FILTER", ClassID: otherClass.ID, EnrollmentDate: now, DateOfBirth: now.AddDate(-20, 0, 0)}
+		create(&designStudent)
+		result = call(ListOpenCourseClasses, designUser.ID, "", nil, 200)
+		json.Unmarshal(result["data"], &visible)
+		if len(visible) != 1 || visible[0].CourseOfferingID != denied.ID {
+			t.Fatalf("second major received wrong catalog: %+v", visible)
+		}
+		call(RegisterCourse, su.ID, "", RegisterCourseRequest{CourseOfferingID: denied.ID}, 400)
+		call(RegisterCourse, su.ID, "", RegisterCourseRequest{ClassID: otherClass.ID, CourseID: otherCourse.ID}, 400)
+		call(RegisterCourse, su.ID, "", RegisterCourseRequest{CourseOfferingID: inconsistent.ID}, 400)
+		call(RegisterCourse, su.ID, "", RegisterCourseRequest{CourseOfferingID: allowed.ID}, 201)
+		db.Model(&designStudent).Update("class_id", nil)
+		call(ListOpenCourseClasses, designUser.ID, "", nil, 400)
+		call(RegisterCourse, designUser.ID, "", RegisterCourseRequest{CourseOfferingID: denied.ID}, 400)
+	})
+
+	t.Log("PASS: migration, academic periods, reusable class/course, term isolation, today/multi-date schedule, conflicts, student schedule, attendance, grading, transcript, exercises, registration, exams, closed term, academic warnings, mobile profile")
 }

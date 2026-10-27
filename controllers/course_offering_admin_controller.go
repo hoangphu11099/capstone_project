@@ -146,6 +146,14 @@ func checkOfferingScheduleConflict(tx *gorm.DB, teacherID, roomID, semesterID, c
 }
 
 func ensureEnrollment(tx *gorm.DB, studentID uint, offering models.CourseOffering) error {
+	// Self-service requests must go through payment confirmation and scheduling.
+	var pending int64
+	if err := tx.Model(&models.CourseRegistration{}).Joins("JOIN course_offerings co ON co.id = course_registrations.course_offering_id").Where("course_registrations.student_id = ? AND course_registrations.course_id = ? AND co.semester_id = ? AND course_registrations.status IN ?", studentID, offering.CourseID, offering.SemesterID, []string{"pending_payment", "paid", "cancelled"}).Count(&pending).Error; err != nil {
+		return err
+	}
+	if pending > 0 {
+		return nil
+	}
 	offeringID := offering.ID
 	var enrollment models.Enrollment
 	err := tx.Where("student_id = ? AND course_offering_id = ?", studentID, offering.ID).First(&enrollment).Error

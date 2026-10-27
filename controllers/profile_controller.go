@@ -15,7 +15,7 @@ func GetOwnProfile(c *gin.Context) {
 		return
 	}
 	var user models.User
-	if err := config.DB.Preload("Role").Preload("Teacher.Major").First(&user, id).Error; err != nil {
+	if err := config.DB.Preload("Role").Preload("Teacher.Major").Preload("Student.Class").First(&user, id).Error; err != nil {
 		c.JSON(404, gin.H{"message": "Không tìm thấy hồ sơ"})
 		return
 	}
@@ -41,7 +41,11 @@ func UpdateOwnProfile(c *gin.Context) {
 		if err := tx.Model(&models.User{}).Where("id = ?", id).Updates(map[string]interface{}{"full_name": strings.TrimSpace(req.FullName), "email": strings.TrimSpace(req.Email)}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&models.Teacher{}).Where("user_id = ?", id).Updates(map[string]interface{}{"phone": strings.TrimSpace(req.Phone), "address": strings.TrimSpace(req.Address)}).Error
+		contact := map[string]interface{}{"phone": strings.TrimSpace(req.Phone), "address": strings.TrimSpace(req.Address)}
+		if err := tx.Model(&models.Teacher{}).Where("user_id = ?", id).Updates(contact).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.Student{}).Where("user_id = ?", id).Updates(contact).Error
 	})
 	if err != nil {
 		c.JSON(400, gin.H{"message": "Không lưu được hồ sơ. Email có thể đã được sử dụng."})

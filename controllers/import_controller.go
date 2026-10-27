@@ -117,7 +117,7 @@ func ImportListStudent(c *gin.Context) {
 			message += ": " + result.Errors[0]
 		}
 
-		c.JSON(http.StatusUnprocessableEntity, gin.H{
+		c.JSON(http.StatusOK, gin.H{
 			"message": message,
 			"result":  result,
 		})
@@ -181,6 +181,10 @@ func parseTeacherImportFile(r io.Reader, filename string) ([]TeacherImportItem, 
 		return nil, errors.New("file import không có dữ liệu")
 	}
 
+	if err := validateImportHeader(rows[0], "username,password,email,fullName,teacherCode,phone,address,qualification,majorCode"); err != nil {
+		return nil, err
+	}
+
 	var items []TeacherImportItem
 	for _, row := range rows[1:] {
 		row = normalizeCSVRow(row, 9)
@@ -211,13 +215,20 @@ func parseStudentImportFile(r io.Reader, filename string) ([]StudentImportItem, 
 		return nil, errors.New("file import không có dữ liệu")
 	}
 
+	if err := validateImportHeader(rows[0], "username,password,email,fullName,studentCode,classId,classCode,gender,phone,address,dateOfBirth"); err != nil {
+		return nil, err
+	}
+
 	var items []StudentImportItem
 	for _, row := range rows[1:] {
 		row = normalizeCSVRow(row, 11)
 		if isEmptyRow(row) {
 			continue
 		}
-		classID, _ := strconv.Atoi(row[5])
+		classID, err := strconv.ParseUint(row[5], 10, 32)
+		if row[5] != "" && (err != nil || classID == 0) {
+			return nil, fmt.Errorf("classId %q phải là số nguyên dương", row[5])
+		}
 		items = append(items, StudentImportItem{
 			Username:    row[0],
 			Password:    row[1],
@@ -267,11 +278,15 @@ func readExcelRows(data []byte) ([][]string, error) {
 }
 
 func readDelimitedRows(data []byte) ([][]string, error) {
+	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
 	reader := csv.NewReader(bytes.NewReader(data))
-	reader.TrimLeadingSpace = true
+	// Trim fields after parsing: tabs may represent empty TSV cells.
+	reader.TrimLeadingSpace = false
 	reader.FieldsPerRecord = -1
 	if bytes.Contains(data, []byte("\t")) && !bytes.Contains(data, []byte(",")) {
 		reader.Comma = '\t'
+	} else if firstLine := strings.SplitN(string(data), "\n", 2)[0]; strings.Count(firstLine, ";") > strings.Count(firstLine, ",") {
+		reader.Comma = ';'
 	}
 	return reader.ReadAll()
 }
@@ -300,6 +315,10 @@ func importOneTeacher(item TeacherImportItem, roleID uint) error {
 		err := tx.Where("username = ?", item.Username).First(&user).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
+		}
+
+		if user.ID != 0 && user.RoleID != roleID {
+			return errors.New("username đã thuộc tài khoản có vai trò khác")
 		}
 
 		passwordHash, err := bcrypt.GenerateFromPassword([]byte(item.Password), bcrypt.DefaultCost)
@@ -341,6 +360,9 @@ func importOneTeacher(item TeacherImportItem, roleID uint) error {
 		err = tx.Where("teacher_code = ?", item.TeacherCode).First(&teacher).Error
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
+		}
+		if teacher.ID != 0 && teacher.UserID != user.ID {
+			return errors.New("teacherCode đã thuộc giảng viên khác")
 		}
 		teacher.TeacherCode = item.TeacherCode
 		teacher.UserID = user.ID
@@ -452,6 +474,10 @@ func importOneStudent(item StudentImportItem, roleID uint) error {
 			return err
 		}
 
+		if user.ID != 0 && user.RoleID != roleID {
+			return errors.New("username đã thuộc tài khoản có vai trò khác")
+		}
+
 		passwordHash, err := bcrypt.GenerateFromPassword([]byte(item.Password), bcrypt.DefaultCost)
 		if err != nil {
 			return err
@@ -478,7 +504,9 @@ func importOneStudent(item StudentImportItem, roleID uint) error {
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		if student.ID == 0 {
+		if code := strings.TrimSpace(item.StudentCode); code != "" {
+			student.StudentCode = code
+		} else if student.ID == 0 {
 			studentCode, err := generateNextStudentCode(tx)
 			if err != nil {
 				return fmt.Errorf("không thể tự sinh mã sinh viên: %w", err)
@@ -521,4 +549,18 @@ func normalizeCSVRow(row []string, size int) []string {
 		out[i] = strings.TrimSpace(row[i])
 	}
 	return out
+}
+
+// Reject shifted or misspelled columns before writing any records.
+func validateImportHeader(row []string, columns string) error {
+	expected := strings.Split(columns, ",")
+	if len(row) != len(expected) {
+		return fmt.Errorf("file phải có %d cột theo mẫu: %s", len(expected), columns)
+	}
+	for i, name := range expected {
+		if !strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(row[i], "\ufeff")), name) {
+			return fmt.Errorf("cột %d phải là %s; vui lòng tải file mẫu", i+1, name)
+		}
+	}
+	return nil
 }

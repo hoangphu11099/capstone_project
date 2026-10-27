@@ -32,7 +32,13 @@ func ViewTranscript(c *gin.Context) {
 	var transcript []responses.TranscriptItem
 	err := config.DB.Table("enrollments e").
 		Select(`
-			c.code AS course_code,
+			e.id,
+            cl.class_code,
+            u.full_name AS teacher_name,
+            sem.name AS semester,
+            COALESCE((SELECT DATE_FORMAT(MIN(s.full_date), '%Y-%m-%d') FROM schedules s WHERE s.course_offering_id = e.course_offering_id), DATE_FORMAT(sem.start_date, '%Y-%m-%d'), '') AS start_date,
+            COALESCE((SELECT DATE_FORMAT(MAX(s.full_date), '%Y-%m-%d') FROM schedules s WHERE s.course_offering_id = e.course_offering_id), DATE_FORMAT(sem.end_date, '%Y-%m-%d'), '') AS end_date,
+            c.code AS course_code,
 			c.name AS course_name,
 			c.credits,
 			g.assignment_score,
@@ -43,6 +49,12 @@ func ViewTranscript(c *gin.Context) {
 		`).
 		Joins("JOIN courses c ON e.course_id = c.id").
 		Joins("JOIN grades g ON g.enrollment_id = e.id").
+		Joins("JOIN classes cl ON cl.id = e.class_id").
+		Joins("LEFT JOIN course_offerings co ON co.id = e.course_offering_id").
+		Joins("LEFT JOIN teachers t ON t.id = COALESCE(co.teacher_id, cl.teacher_id)").
+		Joins("LEFT JOIN users u ON u.id = t.user_id").
+		Joins("LEFT JOIN semesters sem ON sem.id = COALESCE(co.semester_id, cl.semester_id)").
+		Where("e.status <> ?", "cancelled").
 		Where("e.student_id = ?", student.ID).
 		Where("(g.status = ? OR g.status IS NULL OR g.status = '')", "Approved").
 		Order("c.code").

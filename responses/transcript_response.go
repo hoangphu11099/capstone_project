@@ -1,9 +1,15 @@
 package responses
 
 type TranscriptItem struct {
-	CourseCode string `json:"courseCode"`
-	CourseName string `json:"courseName"`
-	Credits    int    `json:"credits"`
+	ID          uint   `json:"id"`
+	ClassCode   string `json:"classCode"`
+	TeacherName string `json:"teacherName"`
+	Semester    string `json:"semester"`
+	StartDate   string `json:"startDate"`
+	EndDate     string `json:"endDate"`
+	CourseCode  string `json:"courseCode"`
+	CourseName  string `json:"courseName"`
+	Credits     int    `json:"credits"`
 
 	AssignmentScore float64 `json:"assignmentScore"`
 	MidtermScore    float64 `json:"midtermScore"`

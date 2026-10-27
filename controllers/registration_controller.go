@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"time"
 
 	"student-management/config"
 	"student-management/models"
@@ -28,7 +27,17 @@ func ListMyCourseRegistrations(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Lấy danh sách học phần đã đăng ký thành công", "data": enrollments})
+	var requests []models.CourseRegistration
+	if err := config.DB.Preload("Enrollment.CourseOffering.Semester").Preload("Enrollment.CourseOffering.Teacher.User").Preload("Enrollment.CourseOffering.Room").Preload("Enrollment.CourseOffering.Schedules").Preload("Course").Preload("Class").Preload("CourseOffering.Semester").Preload("CourseOffering.Teacher.User").Preload("CourseOffering.Room").Preload("CourseOffering.Schedules").Where("student_id = ?", student.ID).Order("registered_at desc").Find(&requests).Error; err != nil {
+		c.JSON(500, gin.H{"message": err.Error()})
+		return
+	}
+	for i := range requests {
+		if requests[i].CourseOffering == nil && requests[i].Enrollment != nil {
+			requests[i].CourseOffering = requests[i].Enrollment.CourseOffering
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Lấy danh sách học phần đã đăng ký thành công", "data": enrollments, "requests": requests})
 }
 
 func CancelCourseRegistration(c *gin.Context) {
@@ -55,6 +64,15 @@ func CancelCourseRegistration(c *gin.Context) {
 		return
 	}
 
+	var paid int64
+	if err := config.DB.Model(&models.CourseRegistration{}).Where("enrollment_id = ? AND payment_confirmed_at IS NOT NULL", enrollment.ID).Count(&paid).Error; err != nil {
+		c.JSON(500, gin.H{"message": err.Error()})
+		return
+	}
+	if paid > 0 {
+		c.JSON(400, gin.H{"message": "Vui lòng liên hệ học vụ để hủy học phần đã xác nhận học phí"})
+		return
+	}
 	semester := enrollment.Class.Semester
 	if enrollment.CourseOffering != nil {
 		semester = enrollment.CourseOffering.Semester
@@ -110,7 +128,30 @@ type OpenCourseClassResponse struct {
 	Schedules        []models.Schedule `json:"schedules"`
 }
 
+func registrationMajor(db *gorm.DB, student models.Student) (models.Major, error) {
+	var class models.Class
+	if student.ClassID == 0 {
+		return models.Major{}, errors.New("Sinh viên chưa được xếp lớp. Vui lòng liên hệ học vụ cập nhật chuyên ngành")
+	}
+	if err := db.Preload("Major").First(&class, student.ClassID).Error; err != nil {
+		return models.Major{}, err
+	}
+	if class.MajorID == 0 || class.Major.ID == 0 {
+		return models.Major{}, errors.New("Lớp sinh viên chưa có chuyên ngành. Vui lòng liên hệ học vụ cập nhật")
+	}
+	return class.Major, nil
+}
+
 func ListOpenCourseClasses(c *gin.Context) {
+	student, ok := getCurrentStudent(c)
+	if !ok {
+		return
+	}
+	major, err := registrationMajor(config.DB, student)
+	if err != nil {
+		c.JSON(400, gin.H{"message": err.Error()})
+		return
+	}
 	var offerings []models.CourseOffering
 
 	query := config.DB.
@@ -120,7 +161,9 @@ func ListOpenCourseClasses(c *gin.Context) {
 		Preload("Semester").
 		Preload("Room").
 		Preload("Schedules").
-		Where("status = ?", "open")
+		Where("status = ?", "open").
+		Where("class_id IN (?)", config.DB.Model(&models.Class{}).Select("id").Where("major_id = ?", major.ID)).
+		Where("course_id IN (?)", config.DB.Model(&models.Course{}).Select("id").Where("major_id = ?", major.ID))
 
 	if semesterID := c.Query("semesterId"); semesterID != "" {
 		query = query.Where("semester_id = ?", semesterID)
@@ -152,6 +195,12 @@ func ListOpenCourseClasses(c *gin.Context) {
 			return
 		}
 
+		var pending int64
+		if err := config.DB.Model(&models.CourseRegistration{}).Where("course_offering_id = ? AND status IN ?", offering.ID, []string{"pending_payment", "paid"}).Count(&pending).Error; err != nil {
+			c.JSON(500, gin.H{"message": err.Error()})
+			return
+		}
+		currentStudents += pending
 		item := OpenCourseClassResponse{
 			CourseOfferingID: offering.ID,
 			ClassID:          offering.ClassID,
@@ -183,8 +232,10 @@ func ListOpenCourseClasses(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Lấy danh sách lớp học phần đang mở thành công",
-		"data":    responses,
+		"message":   "Lấy danh sách lớp học phần đang mở thành công",
+		"data":      responses,
+		"majorId":   major.ID,
+		"majorName": major.Name,
 	})
 }
 func RegisterCourse(c *gin.Context) {
@@ -221,79 +272,15 @@ func RegisterCourse(c *gin.Context) {
 		c.JSON(400, gin.H{"message": "Học phần không tồn tại hoặc có nhiều học kỳ; hãy chọn courseOfferingId"})
 		return
 	}
-	offering := offerings[0]
-	class, course := offering.Class, offering.Course
-	courseID := course.ID
-	if class.Status != "open" || offering.Semester.Status != "active" {
-		c.JSON(400, gin.H{"message": "Lớp hoặc học kỳ chưa mở đăng ký"})
-		return
-	}
-
-	var scheduleCount int64
-	if err := config.DB.Model(&models.Schedule{}).Where("course_offering_id = ?", offering.ID).Count(&scheduleCount).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi kiểm tra lịch học phần", "error": err.Error()})
-		return
-	}
-	if scheduleCount == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "Học phần chưa có lịch học"})
-		return
-	}
-
-	var duplicated int64
-	if err := config.DB.Model(&models.Enrollment{}).
-		Joins("JOIN course_offerings co ON co.id = enrollments.course_offering_id").Where("enrollments.student_id = ? AND enrollments.course_id = ? AND co.semester_id = ? AND enrollments.status <> ?", student.ID, courseID, offering.SemesterID, "cancelled").
-		Count(&duplicated).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi kiểm tra đăng ký học phần", "error": err.Error()})
-		return
-	}
-	if duplicated > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "Sinh viên đã đăng ký môn học này"})
-		return
-	}
-
-	var currentStudents int64
-	if err := config.DB.Model(&models.Enrollment{}).
-		Where("course_offering_id = ? AND status <> ?", offering.ID, "cancelled").
-		Count(&currentStudents).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi kiểm tra sĩ số", "error": err.Error()})
-		return
-	}
-	if class.MaxStudents > 0 && int(currentStudents) >= class.MaxStudents {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "Lớp học phần đã đủ số lượng sinh viên"})
-		return
-	}
-
-	now := time.Now()
-	offeringID := offering.ID
-	enrollment := models.Enrollment{
-		CourseOfferingID: &offeringID,
-		StudentID:        student.ID,
-		ClassID:          class.ID,
-		CourseID:         course.ID,
-		EnrollDate:       now,
-		Status:           "enrolled",
-	}
-
 	var registration models.CourseRegistration
-	if err := config.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&enrollment).Error; err != nil {
-			return err
-		}
-
-		registration = models.CourseRegistration{
-			StudentID:    student.ID,
-			CourseID:     course.ID,
-			ClassID:      class.ID,
-			EnrollmentID: &enrollment.ID,
-			Status:       "registered",
-			RegisteredAt: now,
-			Note:         req.Note,
-		}
-		return tx.Create(&registration).Error
-	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "Đăng ký học phần thất bại", "error": err.Error()})
+	err := config.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		registration, err = createPendingRegistration(tx, student.ID, offerings[0].ID, req.Note)
+		return err
+	})
+	if err != nil {
+		c.JSON(400, gin.H{"message": err.Error()})
 		return
 	}
-
-	c.JSON(http.StatusCreated, gin.H{"message": "Đăng ký học phần thành công", "data": gin.H{"enrollment": enrollment, "registration": registration}})
+	c.JSON(http.StatusCreated, gin.H{"message": registrationSuccessMessage, "data": gin.H{"registration": registration}})
 }
