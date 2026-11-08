@@ -23,15 +23,16 @@ type ScheduleInput struct {
 }
 
 type CreateClassRequest struct {
-	CohortYear  int             `json:"cohortYear"`
-	ClassCode   string          `json:"classCode"`
-	MajorID     uint            `json:"majorId" binding:"required"`
-	TeacherID   uint            `json:"teacherId"`
-	SemesterID  uint            `json:"semesterId"`
-	RoomID      uint            `json:"roomId"`
-	MaxStudents int             `json:"maxStudents"`
-	Status      string          `json:"status"`
-	Schedules   []ScheduleInput `json:"schedules"`
+	AcademicYearID uint            `json:"academicYearId"`
+	CohortYear     int             `json:"cohortYear"`
+	ClassCode      string          `json:"classCode"`
+	MajorID        uint            `json:"majorId" binding:"required"`
+	TeacherID      uint            `json:"teacherId"`
+	SemesterID     uint            `json:"semesterId"`
+	RoomID         uint            `json:"roomId"`
+	MaxStudents    int             `json:"maxStudents"`
+	Status         string          `json:"status"`
+	Schedules      []ScheduleInput `json:"schedules"`
 }
 
 type AssignTeacherRequest struct {
@@ -132,6 +133,14 @@ func CreateClass(c *gin.Context) {
 			return
 		}
 
+	}
+	if req.AcademicYearID > 0 {
+		var academicYear models.AcademicYear
+		if err := config.DB.First(&academicYear, req.AcademicYearID).Error; err != nil {
+			c.JSON(400, gin.H{"message": "Năm học nhập học không tồn tại. Vui lòng chọn lại từ danh sách Năm học."})
+			return
+		}
+		req.CohortYear = academicYear.StartDate.Year()
 	}
 	if req.CohortYear == 0 {
 		req.CohortYear = time.Now().Year()

@@ -86,5 +86,5 @@ func ChangeOwnPassword(c *gin.Context) {
 		c.JSON(400, gin.H{"message": "Không đổi được mật khẩu. Vui lòng thử lại."})
 		return
 	}
-	c.JSON(200, gin.H{"message": "Đổi mật khẩu thành công"})
+	c.JSON(200, gin.H{"message": "Đổi mật khẩu thành công. Vui lòng đăng nhập lại.", "requires_login": true})
 }

@@ -60,6 +60,23 @@ func AddStudentsToClass(c *gin.Context) {
 		if len(students) != len(studentIDs) {
 			return errStudentsNotFound
 		}
+		if class.MajorID == 0 {
+			return errStudentMajorMismatch
+		}
+		for _, student := range students {
+			majorID, err := studentRegisteredMajor(tx, student)
+			if err != nil {
+				return err
+			}
+			if majorID == 0 || majorID != class.MajorID {
+				return errStudentMajorMismatch
+			}
+			if student.MajorID == 0 {
+				if err := tx.Model(&models.Student{}).Where("id=?", student.ID).Update("major_id", majorID).Error; err != nil {
+					return err
+				}
+			}
+		}
 
 		if class.MaxStudents > 0 {
 			var currentStudents int64
@@ -101,6 +118,8 @@ func AddStudentsToClass(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"message": "Một hoặc nhiều sinh viên không tồn tại"})
 		case errors.Is(err, errClassCapacityExceeded):
 			c.JSON(http.StatusBadRequest, gin.H{"message": "Số sinh viên vượt quá sĩ số tối đa của lớp"})
+		case errors.Is(err, errStudentMajorMismatch):
+			c.JSON(http.StatusBadRequest, gin.H{"message": "Chỉ được thêm sinh viên có chuyên ngành đã đăng ký trùng với chuyên ngành của lớp"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"message": "Thêm sinh viên vào lớp thất bại", "error": err.Error()})
 		}
@@ -125,8 +144,23 @@ func AddStudentsToClass(c *gin.Context) {
 
 var (
 	errStudentsNotFound      = errors.New("one or more students do not exist")
+	errStudentMajorMismatch  = errors.New("student registered major differs from class major")
 	errClassCapacityExceeded = errors.New("class capacity exceeded")
 )
+
+func studentRegisteredMajor(db *gorm.DB, student models.Student) (uint, error) {
+	if student.MajorID > 0 {
+		return student.MajorID, nil
+	}
+	if student.ClassID == 0 {
+		return 0, nil
+	}
+	var class models.Class
+	if err := db.Select("id", "major_id").First(&class, student.ClassID).Error; err != nil {
+		return 0, err
+	}
+	return class.MajorID, nil
+}
 
 func uniquePositiveIDs(ids []uint) []uint {
 	result := make([]uint, 0, len(ids))

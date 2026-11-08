@@ -34,6 +34,7 @@ func ListTeacherClasses(c *gin.Context) {
 		Preload("Schedules").
 		Preload("CourseOfferings", "teacher_id = ?", teacher.ID).
 		Preload("CourseOfferings.Course").
+		Preload("CourseOfferings.Teacher.User").
 		Preload("CourseOfferings.Room").
 		Preload("CourseOfferings.Semester").
 		Preload("CourseOfferings.Schedules").

@@ -150,6 +150,17 @@ func SaveSemester(c *gin.Context) {
 func ListAdminCourseOfferings(c *gin.Context) {
 	var rows []models.CourseOffering
 	query := config.DB.Preload("Class").Preload("Course").Preload("Teacher.User").Preload("Semester").Preload("Room").Preload("Schedules")
+	if c.Query("summary") == "true" {
+		delete(query.Statement.Preloads, "Schedules")
+	}
+	if raw := c.Query("id"); raw != "" {
+		id, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil || id == 0 {
+			c.JSON(400, gin.H{"message": "ID học phần không hợp lệ"})
+			return
+		}
+		query = query.Where("id = ?", id)
+	}
 	if id := c.Query("classId"); id != "" {
 		query = query.Where("class_id = ?", id)
 	}

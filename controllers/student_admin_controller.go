@@ -11,6 +11,7 @@ import (
 	"strings"
 	"student-management/config"
 	"student-management/models"
+	"student-management/utils"
 )
 
 func UpdateStudent(c *gin.Context) {
@@ -27,6 +28,11 @@ func UpdateStudent(c *gin.Context) {
 	dob, err := parseOptionalDate(req.DateOfBirth)
 	if err != nil {
 		c.JSON(400, gin.H{"message": "Ngày sinh không hợp lệ"})
+		return
+	}
+	gender, err := normalizeStudentGender(req.Gender)
+	if err != nil {
+		c.JSON(400, gin.H{"message": err.Error()})
 		return
 	}
 	enrolled, err := parseOptionalDate(req.EnrollmentDate)
@@ -51,9 +57,33 @@ func UpdateStudent(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&student, id).Error; err != nil {
 			return err
 		}
-		var class models.Class
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&class, req.ClassID).Error; err != nil {
+		registeredMajor, err := studentRegisteredMajor(tx, student)
+		if err != nil {
 			return err
+		}
+		var class models.Class
+		if req.ClassID > 0 {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&class, req.ClassID).Error; err != nil {
+				return err
+			}
+			if class.MajorID == 0 || (registeredMajor > 0 && registeredMajor != class.MajorID) {
+				return errors.New("Lớp không thuộc chuyên ngành sinh viên đã đăng ký")
+			}
+			if req.MajorID > 0 && req.MajorID != class.MajorID {
+				return errors.New("Không thể đổi chuyên ngành đã đăng ký từ form cập nhật hồ sơ")
+			}
+		} else if req.MajorID > 0 && req.MajorID != registeredMajor {
+			return errStudentMajorMismatch
+		}
+		if req.TrainingSystem != "" {
+			system, err := utils.NormalizeTrainingSystem(req.TrainingSystem)
+			if err != nil {
+				return err
+			}
+			original, _ := utils.NormalizeTrainingSystem(student.TrainingSystem)
+			if system != original {
+				return errors.New("Hệ đào tạo đã đăng ký được giữ nguyên khi sửa hồ sơ")
+			}
 		}
 		if student.ClassID != req.ClassID {
 			if class.Status != "open" {
@@ -75,7 +105,13 @@ func UpdateStudent(c *gin.Context) {
 		if err := tx.Model(&models.User{}).Where("id = ?", student.UserID).Updates(users).Error; err != nil {
 			return errors.New("Không thể cập nhật tài khoản. Kiểm tra tên đăng nhập hoặc email đã tồn tại")
 		}
-		fields := map[string]interface{}{"class_id": req.ClassID, "gender": strings.TrimSpace(req.Gender), "phone": strings.TrimSpace(req.Phone), "address": strings.TrimSpace(req.Address), "date_of_birth": nil}
+		fields := map[string]interface{}{"class_id": nil, "gender": gender, "phone": strings.TrimSpace(req.Phone), "address": strings.TrimSpace(req.Address), "date_of_birth": nil}
+		if req.ClassID > 0 {
+			fields["class_id"] = req.ClassID
+		}
+		if student.MajorID == 0 {
+			fields["major_id"] = class.MajorID
+		}
 		if !dob.IsZero() {
 			fields["date_of_birth"] = dob
 		}

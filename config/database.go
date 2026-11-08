@@ -65,6 +65,7 @@ func AutoMigrateDB() {
 	if err := DB.AutoMigrate(
 		&models.Role{},
 		&models.User{},
+		&models.AuthSession{},
 		&models.Teacher{},
 		&models.Student{},
 		&models.Major{},
@@ -99,6 +100,10 @@ func AutoMigrateDB() {
 		&models.PublicProgram{},
 	); err != nil {
 		log.Fatal("Failed to migrate database:", err)
+	}
+	// Backfill once for legacy students; never overwrite an already registered major.
+	if err := DB.Exec("UPDATE students s JOIN classes c ON c.id=s.class_id SET s.major_id=c.major_id WHERE (s.major_id IS NULL OR s.major_id=0) AND c.major_id>0").Error; err != nil {
+		log.Fatal("Failed to initialize student registered majors:", err)
 	}
 }
 

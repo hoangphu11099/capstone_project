@@ -1,10 +1,11 @@
 package controllers
 
 import (
-	"crypto/rand"
-	"encoding/base64"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"net/http"
 	"strings"
+	"time"
 
 	"student-management/config"
 	"student-management/middleware"
@@ -16,12 +17,13 @@ import (
 )
 
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Username string `json:"username" binding:"required,max=254"`
+	Password string `json:"password" binding:"required,max=72"`
 }
 
 type ChangePasswordRequest struct {
-	NewPassword string `json:"new_password" binding:"required"`
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password" binding:"required"`
 }
 
 type ForgotPasswordRequest struct {
@@ -29,20 +31,30 @@ type ForgotPasswordRequest struct {
 	Email    string `json:"email"`
 }
 
-func generateTemporaryPassword() (string, error) {
-	randomBytes := make([]byte, 9)
-	if _, err := rand.Read(randomBytes); err != nil {
+func issueLoginToken(tx *gorm.DB, user models.User) (string, error) {
+	token, err := utils.GenerateToken(user.ID, user.Role.Name)
+	if err != nil {
 		return "", err
 	}
-	return "Tmp-" + base64.RawURLEncoding.EncodeToString(randomBytes), nil
+	claims, err := utils.ParseToken(token)
+	if err != nil {
+		return "", err
+	}
+	session := models.AuthSession{ID: claims.ID, UserID: user.ID, CredentialFingerprint: utils.CredentialFingerprint(user.Password), ExpiresAt: claims.ExpiresAt.Time}
+	if err = tx.Create(&session).Error; err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 func Login(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
 	var input LoginRequest
 
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Username and password are required",
+			"error": "Vui lòng nhập tên đăng nhập và mật khẩu hợp lệ",
 		})
 		return
 	}
@@ -51,14 +63,14 @@ func Login(c *gin.Context) {
 		Where("username = ? OR email = ?", input.Username, input.Username).
 		First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": "User not found",
+			"error": "Tên đăng nhập hoặc mật khẩu không đúng",
 		})
 		return
 	}
 
 	if !user.IsActive {
 		c.JSON(http.StatusForbidden, gin.H{
-			"error": "User account is inactive",
+			"error": "Tài khoản đã bị vô hiệu hóa. Vui lòng liên hệ quản trị viên",
 		})
 		return
 	}
@@ -66,23 +78,25 @@ func Login(c *gin.Context) {
 	err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": "Wrong password",
+			"error": "Tên đăng nhập hoặc mật khẩu không đúng",
 		})
 		return
 	}
 
-	token, err := utils.GenerateToken(user.ID, user.Role.Name)
+	token, err := issueLoginToken(config.DB, user)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Cannot generate token",
+			"error": "Không thể đăng nhập. Vui lòng thử lại sau",
 		})
 		return
 	}
 
 	if user.FirstLogin {
 		c.JSON(http.StatusOK, gin.H{
-			"message":     "First login, please change password",
+			"message":     "Đây là lần đăng nhập đầu tiên. Vui lòng đổi mật khẩu",
 			"token":       token,
+			"token_type":  "Bearer",
+			"expires_in":  int(utils.AccessTokenLifetime / time.Second),
 			"first_login": true,
 			"user": gin.H{
 				"id":       user.ID,
@@ -95,8 +109,10 @@ func Login(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":     "Login successfully",
+		"message":     "Đăng nhập thành công",
 		"token":       token,
+		"token_type":  "Bearer",
+		"expires_in":  int(utils.AccessTokenLifetime / time.Second),
 		"first_login": false,
 		"user": gin.H{
 			"id":       user.ID,
@@ -125,7 +141,7 @@ func ChangePassword(c *gin.Context) {
 		return
 	}
 
-	if len(req.NewPassword) < 6 {
+	if len(req.NewPassword) < 6 || len(req.NewPassword) > 72 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "New password must be at least 6 characters",
 		})
@@ -156,6 +172,14 @@ func ChangePassword(c *gin.Context) {
 		return
 	}
 
+	if !user.FirstLogin && bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.CurrentPassword)) != nil {
+		c.JSON(400, gin.H{"message": "Current password is incorrect"})
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.NewPassword)) == nil {
+		c.JSON(400, gin.H{"message": "New password must differ from current password"})
+		return
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -164,81 +188,50 @@ func ChangePassword(c *gin.Context) {
 		return
 	}
 
-	user.Password = string(hash)
-	user.FirstLogin = false
-
-	if err := config.DB.Save(&user).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Cannot update password",
-		})
+	var token string
+	err = config.DB.Transaction(func(tx *gorm.DB) error {
+		var current models.User
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Preload("Role").First(&current, user.ID).Error; err != nil {
+			return err
+		}
+		if current.Password != user.Password {
+			return gorm.ErrInvalidData
+		}
+		current.Password = string(hash)
+		current.FirstLogin = false
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", user.ID).Delete(&models.AuthSession{}).Error; err != nil {
+			return err
+		}
+		var err error
+		token, err = issueLoginToken(tx, current)
+		return err
+	})
+	if err != nil {
+		c.JSON(500, gin.H{"message": "Cannot update password"})
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":     "Password changed successfully",
-		"first_login": false,
-	})
+	c.Header("Cache-Control", "no-store")
+	c.JSON(200, gin.H{"message": "Password changed successfully", "first_login": false, "token": token, "token_type": "Bearer", "expires_in": int(utils.AccessTokenLifetime / time.Second)})
 }
 
 func ForgotPassword(c *gin.Context) {
 	var req ForgotPasswordRequest
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+	if c.ShouldBindJSON(&req) != nil || (strings.TrimSpace(req.Username) == "" && strings.TrimSpace(req.Email) == "") {
+		c.JSON(400, gin.H{"message": "Username or email is required"})
 		return
 	}
-
-	identity := strings.TrimSpace(req.Username)
-	if identity == "" {
-		identity = strings.TrimSpace(req.Email)
-	}
-	if identity == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Username or email is required"})
-		return
-	}
-
-	var user models.User
-	if err := config.DB.Where("username = ? OR email = ?", identity, identity).First(&user).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-		return
-	}
-
-	tempPass, err := generateTemporaryPassword()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Cannot generate temporary password",
-		})
-		return
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(tempPass), bcrypt.DefaultCost)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Cannot hash temporary password",
-		})
-		return
-	}
-
-	user.Password = string(hash)
-	user.FirstLogin = true
-
-	if err := config.DB.Save(&user).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Cannot reset password",
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":       "Temporary password set. User must change password on first login.",
-		"temp_password": tempPass,
-		"first_login":   true,
-	})
+	c.Header("Cache-Control", "no-store")
+	c.JSON(202, gin.H{"message": "Vui lòng liên hệ quản trị viên hoặc Bộ phận Đào tạo để xác minh danh tính và được cấp lại mật khẩu."})
 }
 
 func Logout(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "Đăng xuất thành công",
-	})
+	if err := config.DB.Where("id = ?", c.GetString(middleware.ContextSessionIDKey)).Delete(&models.AuthSession{}).Error; err != nil {
+		c.JSON(500, gin.H{"message": "Không thể kết thúc phiên đăng nhập. Vui lòng thử lại."})
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(200, gin.H{"success": true, "message": "Đăng xuất thành công"})
 }

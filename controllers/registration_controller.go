@@ -109,6 +109,7 @@ type RegisterCourseRequest struct {
 }
 type OpenCourseClassResponse struct {
 	CourseOfferingID uint              `json:"courseOfferingId"`
+	OfferingCode     string            `json:"offeringCode"`
 	ClassID          uint              `json:"classId"`
 	ClassCode        string            `json:"classCode"`
 	CourseID         uint              `json:"courseId"`
@@ -129,6 +130,13 @@ type OpenCourseClassResponse struct {
 }
 
 func registrationMajor(db *gorm.DB, student models.Student) (models.Major, error) {
+	if student.MajorID > 0 {
+		var major models.Major
+		if err := db.First(&major, student.MajorID).Error; err != nil {
+			return major, err
+		}
+		return major, nil
+	}
 	var class models.Class
 	if student.ClassID == 0 {
 		return models.Major{}, errors.New("Sinh viên chưa được xếp lớp. Vui lòng liên hệ học vụ cập nhật chuyên ngành")
@@ -203,6 +211,7 @@ func ListOpenCourseClasses(c *gin.Context) {
 		currentStudents += pending
 		item := OpenCourseClassResponse{
 			CourseOfferingID: offering.ID,
+			OfferingCode:     offering.OfferingCode,
 			ClassID:          offering.ClassID,
 			ClassCode:        offering.Class.ClassCode,
 			CourseID:         offering.CourseID,

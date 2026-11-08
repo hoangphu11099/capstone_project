@@ -14,6 +14,7 @@ import (
 
 	"student-management/config"
 	"student-management/models"
+	"student-management/utils"
 
 	"github.com/gin-gonic/gin"
 	"github.com/xuri/excelize/v2"
@@ -504,16 +505,36 @@ func importOneStudent(item StudentImportItem, roleID uint) error {
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
+		var targetClass models.Class
+		if err := tx.Preload("Major").First(&targetClass, classID).Error; err != nil {
+			return err
+		}
 		if code := strings.TrimSpace(item.StudentCode); code != "" {
 			student.StudentCode = code
 		} else if student.ID == 0 {
-			studentCode, err := generateNextStudentCode(tx)
+			var identity utils.StudentIdentity
+			sequence, parseErr := strconv.ParseUint(strings.TrimPrefix(item.Username, "student"), 10, 64)
+			if parseErr == nil && strings.HasPrefix(item.Username, "student") && sequence > 0 {
+				identity, err = utils.FormatStudentIdentity(item.FullName, time.Now().In(attendanceLocation()).Year(), "CQ", targetClass.Major.Code, sequence)
+			} else {
+				identity, err = nextStudentIdentity(tx, item.FullName, time.Now().In(attendanceLocation()).Year(), "CQ", targetClass.Major)
+			}
 			if err != nil {
 				return fmt.Errorf("không thể tự sinh mã sinh viên: %w", err)
 			}
-			student.StudentCode = studentCode
+			student.StudentCode = identity.StudentCode
 		}
 		student.UserID = user.ID
+		if student.ID > 0 {
+			registeredMajor, err := studentRegisteredMajor(tx, student)
+			if err != nil {
+				return err
+			}
+			if registeredMajor > 0 && registeredMajor != targetClass.MajorID {
+				return errors.New("Lớp không thuộc chuyên ngành sinh viên đã đăng ký")
+			}
+		}
+		student.MajorID = targetClass.MajorID
 		student.ClassID = classID
 		student.DateOfBirth = dob
 		student.Gender = strings.TrimSpace(item.Gender)

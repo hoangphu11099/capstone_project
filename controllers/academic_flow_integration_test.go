@@ -152,7 +152,8 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	payload = call(SaveSemester, adminUser.ID, "", PeriodRequest{Name: "Previous term", AcademicYearID: year.ID, StartDate: day(now.AddDate(0, 0, -90)), EndDate: day(now.AddDate(0, 0, -10)), Status: "active"}, 200)
 	json.Unmarshal(payload["data"], &previous)
 	call(SaveSemester, adminUser.ID, "", PeriodRequest{Name: "Bad term", AcademicYearID: year.ID, StartDate: day(now.AddDate(2, 0, 0)), EndDate: day(now.AddDate(2, 0, 1))}, 400)
-	payload = call(CreateClass, adminUser.ID, "", CreateClassRequest{MajorID: major.ID, CohortYear: now.Year(), MaxStudents: 30}, 201)
+	call(CreateClass, adminUser.ID, "", CreateClassRequest{MajorID: major.ID, AcademicYearID: 99999999}, 400)
+	payload = call(CreateClass, adminUser.ID, "", CreateClassRequest{MajorID: major.ID, AcademicYearID: year.ID, CohortYear: 2000, MaxStudents: 30}, 201)
 	var classData struct {
 		Class models.Class `json:"class"`
 	}
@@ -383,6 +384,29 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		t.Fatal("class sync bypassed pending tuition")
 	}
 	call(ListAdminCourseRegistrations, adminUser.ID, "", nil, 200)
+	filtered := call(func(c *gin.Context) {
+		c.Request.URL.RawQuery = fmt.Sprintf("classId=%d&summary=true", class.ID)
+		ListAdminCourseRegistrations(c)
+	}, adminUser.ID, "", nil, 200)
+	var classRegistrations []models.CourseRegistration
+	if err := json.Unmarshal(filtered["data"], &classRegistrations); err != nil {
+		t.Fatal(err)
+	}
+	if len(classRegistrations) == 0 {
+		t.Fatal("class filter lost registrations")
+	}
+	for _, registration := range classRegistrations {
+		if registration.ClassID != class.ID {
+			t.Fatal("class filter leaked another class")
+		}
+		if registration.CourseOffering != nil && len(registration.CourseOffering.Schedules) > 0 {
+			t.Fatal("summary loaded schedules")
+		}
+	}
+	call(func(c *gin.Context) {
+		c.Request.URL.RawQuery = "classId=invalid"
+		ListAdminCourseRegistrations(c)
+	}, adminUser.ID, "", nil, 400)
 	paymentResult := call(ConfirmRegistrationPayment, adminUser.ID, fmt.Sprint(pendingRegistration.ID), nil, 200)
 	var confirmedPayment models.CourseRegistration
 	json.Unmarshal(paymentResult["data"], &confirmedPayment)
@@ -700,6 +724,156 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		t.Fatal("created room missing from scheduling metadata")
 	}
 
+	t.Run("JWT sessions enforce logout password rotation account state and first login", func(t *testing.T) {
+		hash, err := bcrypt.GenerateFromPassword([]byte("InitialPass123"), bcrypt.DefaultCost)
+		if err != nil {
+			t.Fatal(err)
+		}
+		account := models.User{Username: "jwt-audit", Email: "jwt-audit@example.test", FullName: "Auth test", Password: string(hash), RoleID: adminRole.ID, IsActive: true}
+		create(&account)
+		db.Model(&account).Update("first_login", false)
+		router := gin.New()
+		router.POST("/login", Login)
+		router.POST("/forgot-password", ForgotPassword)
+		router.GET("/private", middleware.AuthRequired(), middleware.RoleRequired("admin"), func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+		router.POST("/logout", middleware.AuthRequired(), Logout)
+		router.POST("/change-password", middleware.AuthRequired(), ChangePassword)
+		request := func(method, path, token string, body any, want int) map[string]json.RawMessage {
+			t.Helper()
+			raw, _ := json.Marshal(body)
+			req := httptest.NewRequest(method, path, bytes.NewReader(raw))
+			req.Header.Set("Content-Type", "application/json")
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, req)
+			if response.Code != want {
+				t.Fatalf("%s %s: want %d, got %d: %s", method, path, want, response.Code, response.Body.String())
+			}
+			var result map[string]json.RawMessage
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			return result
+		}
+		login := func(password string) string {
+			result := request("POST", "/login", "", LoginRequest{Username: account.Username, Password: password}, 200)
+			var token string
+			json.Unmarshal(result["token"], &token)
+			if token == "" {
+				t.Fatal("login did not issue a token")
+			}
+			return token
+		}
+		request("GET", "/private", "", nil, 401)
+		request("POST", "/login", "", LoginRequest{Username: account.Username, Password: "wrong"}, 401)
+		token := login("InitialPass123")
+		request("GET", "/private", token, nil, 200)
+		request("POST", "/logout", token, nil, 200)
+		request("GET", "/private", token, nil, 401)
+		token = login("InitialPass123")
+		db.Model(&account).Update("is_active", false)
+		request("GET", "/private", token, nil, 401)
+		db.Model(&account).Update("is_active", true)
+		db.Model(&account).Update("role_id", teacherRole.ID)
+		request("GET", "/private", token, nil, 401)
+		db.Model(&account).Update("role_id", adminRole.ID)
+		db.Model(&account).Update("first_login", true)
+		request("GET", "/private", token, nil, 403)
+		request("POST", "/change-password", token, ChangePasswordRequest{NewPassword: "InitialPass123"}, 400)
+		request("POST", "/change-password", token, ChangePasswordRequest{NewPassword: "short"}, 400)
+		request("GET", "/private", token, nil, 403)
+		updated := request("POST", "/change-password", token, ChangePasswordRequest{NewPassword: "ChangedPass123"}, 200)
+		var fresh string
+		json.Unmarshal(updated["token"], &fresh)
+		request("GET", "/private", token, nil, 401)
+		request("GET", "/private", fresh, nil, 200)
+		request("POST", "/change-password", fresh, ChangePasswordRequest{NewPassword: "AnotherPass123"}, 400)
+		second := login("ChangedPass123")
+		updated = request("POST", "/change-password", fresh, ChangePasswordRequest{CurrentPassword: "ChangedPass123", NewPassword: "AnotherPass123"}, 200)
+		request("GET", "/private", second, nil, 401)
+		json.Unmarshal(updated["token"], &fresh)
+		request("GET", "/private", fresh, nil, 200)
+		forgot := request("POST", "/forgot-password", "", ForgotPasswordRequest{Email: account.Email}, 202)
+		if _, exposed := forgot["temp_password"]; exposed {
+			t.Fatal("public password recovery leaked a password")
+		}
+		var unchanged models.User
+		db.First(&unchanged, account.ID)
+		if bcrypt.CompareHashAndPassword([]byte(unchanged.Password), []byte("AnotherPass123")) != nil {
+			t.Fatal("public forgot-password changed credentials")
+		}
+		// An administrative password reset invalidates every previously issued token.
+		newHash, _ := bcrypt.GenerateFromPassword([]byte("AdminReset123"), bcrypt.DefaultCost)
+		db.Model(&account).Update("password", string(newHash))
+		request("GET", "/private", fresh, nil, 401)
+		fresh = login("AdminReset123")
+		db.Model(&models.AuthSession{}).Where("user_id = ?", account.ID).Update("expires_at", now.Add(-time.Hour))
+		request("GET", "/private", fresh, nil, 401)
+	})
+
+	t.Run("reschedule one accepted lesson without adding or losing lessons", func(t *testing.T) {
+		makeupClass := models.Class{ClassCode: "MAKEUP_TEST", MajorID: major.ID, Status: "open", MaxStudents: 30}
+		makeupCourse := models.Course{Code: "MAKEUP_COURSE", Name: "Makeup course", MajorID: major.ID, IsActive: true}
+		makeupUser := user("makeup-teacher", teacherRole.ID)
+		makeupTeacher := models.Teacher{UserID: makeupUser.ID, TeacherCode: "MAKEUP_T", MajorID: major.ID, HireDate: now}
+		makeupRoom := models.Room{Name: "MAKEUP_ROOM", Capacity: 30}
+		create(&makeupClass)
+		create(&makeupCourse)
+		create(&makeupTeacher)
+		create(&makeupRoom)
+		offering := models.CourseOffering{ClassID: makeupClass.ID, CourseID: makeupCourse.ID, TeacherID: makeupTeacher.ID, RoomID: makeupRoom.ID, SemesterID: term.ID, Status: "open"}
+		create(&offering)
+		originalDate, otherDate := now.AddDate(0, 0, 20), now.AddDate(0, 0, 27)
+		lesson := models.Schedule{ClassID: makeupClass.ID, CourseOfferingID: &offering.ID, FullDate: &originalDate, DayOfWeek: originalDate.Format("Mon"), StartTime: "09:00", EndTime: "10:00"}
+		other := models.Schedule{ClassID: makeupClass.ID, CourseOfferingID: &offering.ID, FullDate: &otherDate, DayOfWeek: otherDate.Format("Mon"), StartTime: "09:00", EndTime: "10:00"}
+		create(&lesson)
+		create(&other)
+		handler := func(c *gin.Context) {
+			c.Params = append(c.Params, gin.Param{Key: "scheduleId", Value: fmt.Sprint(lesson.ID)})
+			RescheduleLesson(c)
+		}
+		input := RescheduleLessonRequest{TeachingDate: day(now.AddDate(0, 0, 21)), StartTime: "13:30", EndTime: "16:30", Session: "Chiều", Reason: "Nghỉ lễ, bố trí học bù", ExpectedDate: day(originalDate), ExpectedStartTime: "09:00", ExpectedEndTime: "10:00"}
+		bad := input
+		bad.TeachingDate = day(now.AddDate(0, 0, -1))
+		call(handler, adminUser.ID, fmt.Sprint(makeupClass.ID), bad, 400)
+		bad = input
+		bad.Reason = " "
+		call(handler, adminUser.ID, fmt.Sprint(makeupClass.ID), bad, 400)
+		bad = input
+		bad.TeachingDate = day(otherDate)
+		bad.StartTime = "09:00"
+		bad.EndTime = "10:00"
+		call(handler, adminUser.ID, fmt.Sprint(makeupClass.ID), bad, 400)
+		call(handler, adminUser.ID, fmt.Sprint(makeupClass.ID), input, 200)
+		var saved models.Schedule
+		if err := db.First(&saved, lesson.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if day(*saved.FullDate) != input.TeachingDate || saved.OriginalDate == nil || day(*saved.OriginalDate) != day(originalDate) || saved.RescheduleReason != input.Reason || saved.StartTime != input.StartTime {
+			t.Fatalf("lesson was not moved correctly: %+v", saved)
+		}
+		var rows []models.Schedule
+		db.Where("course_offering_id = ?", offering.ID).Find(&rows)
+		if len(rows) != 2 {
+			t.Fatalf("reschedule changed the lesson count: %d", len(rows))
+		}
+		var untouched models.Schedule
+		db.First(&untouched, other.ID)
+		if day(*untouched.FullDate) != day(otherDate) || untouched.StartTime != "09:00" {
+			t.Fatal("other lesson changed")
+		}
+		call(handler, adminUser.ID, fmt.Sprint(makeupClass.ID), input, 400) // stale admin draft
+		input.ExpectedDate = input.TeachingDate
+		input.ExpectedStartTime = input.StartTime
+		input.ExpectedEndTime = input.EndTime
+		input.TeachingDate = day(now.AddDate(0, 0, 22))
+		scheduleID := lesson.ID
+		create(&models.AttendanceSession{CourseOfferingID: &offering.ID, ScheduleID: &scheduleID, ClassID: makeupClass.ID, CourseID: makeupCourse.ID, TeacherID: makeupTeacher.ID, Code: "makeup-attendance", ClassDate: *saved.FullDate, ExpiresAt: now.Add(time.Hour), Status: "confirmed", IsActive: false})
+		call(handler, adminUser.ID, fmt.Sprint(makeupClass.ID), input, 400)
+	})
+
 	t.Run("teaching offer creates schedule only after acceptance", func(t *testing.T) {
 		offerClass := models.Class{ClassCode: "OFFER_TEST", MajorID: major.ID, Status: "open", MaxStudents: 30}
 		create(&offerClass)
@@ -715,6 +889,29 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		result := call(CreateClassOffer, adminUser.ID, "", input, 201)
 		var offer models.ClassOffer
 		json.Unmarshal(result["data"], &offer)
+		for _, uid := range []uint{tu.ID, tu2.ID} {
+			mail := call(ListMyClassOffers, uid, "", nil, 200)
+			var inbox []models.ClassOffer
+			if err := json.Unmarshal(mail["data"], &inbox); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, item := range inbox {
+				wantTeacher := teacher.ID
+				if uid == tu2.ID {
+					wantTeacher = teacher2.ID
+				}
+				if item.TeacherID != wantTeacher {
+					t.Fatal("another teacher's invitation leaked into inbox")
+				}
+				if item.ID == offer.ID {
+					found = true
+				}
+			}
+			if found != (uid == tu2.ID) {
+				t.Fatal("invitation must appear only in recipient inbox")
+			}
+		}
 		var planned teachingOfferPlan
 		if json.Unmarshal([]byte(offer.PlanJSON), &planned) != nil || len(planned.Schedules) != 2 {
 			t.Fatal("missing immutable detailed plan")
@@ -726,6 +923,28 @@ func TestAcademicFlowIntegration(t *testing.T) {
 			t.Fatal("pending offer assigned course before acceptance")
 		}
 		call(AcceptClassOffer, tu.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 404)
+		call(ReadClassOffer, tu.ID, fmt.Sprint(offer.ID), nil, 404)
+		call(DeleteReadClassOffer, tu2.ID, fmt.Sprint(offer.ID), nil, 400)
+		call(DeleteReadClassOffer, tu.ID, fmt.Sprint(offer.ID), nil, 400)
+		call(ReadClassOffer, tu2.ID, fmt.Sprint(offer.ID), nil, 200)
+		var readOffer models.ClassOffer
+		db.First(&readOffer, offer.ID)
+		if readOffer.ReadAt == nil {
+			t.Fatal("opening invitation did not persist read status")
+		}
+		readTime := *readOffer.ReadAt
+		call(ReadClassOffer, tu2.ID, fmt.Sprint(offer.ID), nil, 200)
+		db.First(&readOffer, offer.ID)
+		if !readOffer.ReadAt.Equal(readTime) {
+			t.Fatal("reading again replaced first read timestamp")
+		}
+		call(ReadAllClassOffers, tu2.ID, "", nil, 200)
+		call(DeleteReadClassOffer, tu2.ID, fmt.Sprint(offer.ID), nil, 200)
+		var archived models.ClassOffer
+		if err := db.First(&archived, offer.ID).Error; err != nil || archived.TeacherDeletedAt == nil {
+			t.Fatal("deleting mail must hide it without removing assignment history", err)
+		}
+		call(DeleteReadClassOffers, tu2.ID, "", nil, 200)
 		call(AcceptClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{Note: "Confirmed"}, 200)
 		call(AcceptClassOffer, tu2.ID, fmt.Sprint(offer.ID), ClassOfferResponseRequest{}, 400)
 		var received models.CourseOffering
@@ -1118,8 +1337,14 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		call(RegisterCourse, su.ID, "", RegisterCourseRequest{CourseOfferingID: inconsistent.ID}, 400)
 		call(RegisterCourse, su.ID, "", RegisterCourseRequest{CourseOfferingID: allowed.ID}, 201)
 		db.Model(&designStudent).Update("class_id", nil)
-		call(ListOpenCourseClasses, designUser.ID, "", nil, 400)
-		call(RegisterCourse, designUser.ID, "", RegisterCourseRequest{CourseOfferingID: denied.ID}, 400)
+		call(ListOpenCourseClasses, designUser.ID, "", nil, 200)
+		call(RegisterCourse, designUser.ID, "", RegisterCourseRequest{CourseOfferingID: denied.ID}, 201)
+		var unassigned models.Student
+		db.First(&unassigned, designStudent.ID)
+		if unassigned.ClassID != 0 {
+			t.Fatal("registering a teaching section changed the homeroom")
+		}
+		call(RegisterCourse, designUser.ID, "", RegisterCourseRequest{CourseOfferingID: allowed.ID}, 400)
 	})
 
 	t.Log("PASS: migration, academic periods, reusable class/course, term isolation, today/multi-date schedule, conflicts, student schedule, attendance, grading, transcript, exercises, registration, exams, closed term, academic warnings, mobile profile")

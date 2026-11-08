@@ -6,16 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"student-management/config"
 	"student-management/models"
+	"student-management/utils"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type CreateStudentRequest struct {
@@ -24,7 +27,10 @@ type CreateStudentRequest struct {
 	Email          string `json:"email"`
 	FullName       string `json:"fullName" binding:"required"`
 	StudentCode    string `json:"studentCode"`
-	ClassID        uint   `json:"classId" binding:"required"`
+	MajorID        uint   `json:"majorId"`
+	TrainingSystem string `json:"trainingSystem"`
+	AutoIdentity   bool   `json:"autoIdentity"`
+	ClassID        uint   `json:"classId"`
 	DateOfBirth    string `json:"dateOfBirth"`
 	Gender         string `json:"gender"`
 	Phone          string `json:"phone"`
@@ -46,6 +52,7 @@ type CreateTeacherRequest struct {
 }
 
 func CreateTeacher(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var req CreateTeacherRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Dữ liệu tạo giảng viên không hợp lệ", "error": err.Error()})
@@ -55,11 +62,16 @@ func CreateTeacher(c *gin.Context) {
 	if !validateTeacherMajor(c, req.MajorID) {
 		return
 	}
-	password := strings.TrimSpace(req.Password)
+	password := req.Password
 	if password == "" {
-		password = "Teacher@123"
+		temporary := make([]byte, 12)
+		if _, err := rand.Read(temporary); err != nil {
+			c.JSON(500, gin.H{"message": "Cannot generate temporary password"})
+			return
+		}
+		password = hex.EncodeToString(temporary)
 	}
-	if len(password) < 6 {
+	if len(password) < 6 || len(password) > 72 {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Mật khẩu phải có ít nhất 6 ký tự"})
 		return
 	}
@@ -104,17 +116,38 @@ func CreateTeacher(c *gin.Context) {
 }
 
 func CreateStudent(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	var req CreateStudentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Dữ liệu tạo sinh viên không hợp lệ", "error": err.Error()})
 		return
 	}
-
-	password := strings.TrimSpace(req.Password)
-	if password == "" {
-		password = "Student@123"
+	gender, err := normalizeStudentGender(req.Gender)
+	if err != nil {
+		c.JSON(400, gin.H{"message": err.Error()})
+		return
 	}
-	if len(password) < 6 {
+	system, err := utils.NormalizeTrainingSystem(req.TrainingSystem)
+	if err != nil {
+		c.JSON(400, gin.H{"message": err.Error()})
+		return
+	}
+	code := strings.ToUpper(strings.TrimSpace(req.StudentCode))
+	if code != "" && !studentCodePattern.MatchString(code) {
+		c.JSON(400, gin.H{"message": "Mã sinh viên chỉ gồm chữ in hoa và chữ số, từ 3 đến 32 ký tự"})
+		return
+	}
+
+	password := req.Password
+	if password == "" {
+		temporary := make([]byte, 12)
+		if _, err := rand.Read(temporary); err != nil {
+			c.JSON(500, gin.H{"message": "Cannot generate temporary password"})
+			return
+		}
+		password = hex.EncodeToString(temporary)
+	}
+	if len(password) < 6 || len(password) > 72 {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Mật khẩu phải có ít nhất 6 ký tự"})
 		return
 	}
@@ -152,9 +185,32 @@ func CreateStudent(c *gin.Context) {
 	}
 
 	var class models.Class
-	if err := config.DB.First(&class, req.ClassID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"message": "Không tìm thấy lớp của sinh viên"})
+	if req.ClassID > 0 {
+		if err := config.DB.First(&class, req.ClassID).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"message": "Không tìm thấy lớp của sinh viên"})
+			return
+		}
+		if class.MajorID == 0 || (req.MajorID > 0 && req.MajorID != class.MajorID) {
+			c.JSON(400, gin.H{"message": "Vui lòng chọn lớp thuộc đúng chuyên ngành đã đăng ký"})
+			return
+		}
+		if req.MajorID == 0 {
+			req.MajorID = class.MajorID
+		}
+	}
+	var major models.Major
+	if err := config.DB.First(&major, req.MajorID).Error; err != nil {
+		c.JSON(400, gin.H{"message": "Không tìm thấy chuyên ngành đăng ký"})
 		return
+	}
+	if req.AutoIdentity {
+		username := strings.TrimSpace(req.Username)
+		sequence, parseErr := strconv.ParseUint(strings.TrimPrefix(username, "student"), 10, 64)
+		identity, formatErr := utils.FormatStudentIdentity(req.FullName, enrollmentDate.Year(), system, major.Code, sequence)
+		if parseErr != nil || formatErr != nil || username != identity.Username || code != identity.StudentCode || strings.TrimSpace(req.Email) != identity.Email || identity.Email == "" {
+			c.JSON(400, gin.H{"message": "Mã sinh viên, email hoặc tên đăng nhập chưa khớp thông tin. Vui lòng bấm Cập nhật mã để lấy lại."})
+			return
+		}
 	}
 
 	user := models.User{
@@ -169,8 +225,10 @@ func CreateStudent(c *gin.Context) {
 
 	student := models.Student{
 		ClassID:        req.ClassID,
+		MajorID:        major.ID,
+		TrainingSystem: system,
 		DateOfBirth:    dateOfBirth,
-		Gender:         strings.TrimSpace(req.Gender),
+		Gender:         gender,
 		Phone:          strings.TrimSpace(req.Phone),
 		Address:        strings.TrimSpace(req.Address),
 		EnrollmentDate: enrollmentDate,
@@ -178,11 +236,47 @@ func CreateStudent(c *gin.Context) {
 	}
 
 	if err := config.DB.Transaction(func(tx *gorm.DB) error {
-		studentCode, err := generateNextStudentCode(tx)
-		if err != nil {
+		var count int64
+		if req.ClassID > 0 {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&class, req.ClassID).Error; err != nil {
+				return err
+			}
+			if class.Status != "open" {
+				return errors.New("Lớp đã đóng, không thể thêm sinh viên")
+			}
+			if class.MajorID == 0 || (req.MajorID > 0 && req.MajorID != class.MajorID) {
+				return errStudentMajorMismatch
+			}
+			student.MajorID = class.MajorID
+			if err := tx.Model(&models.Student{}).Where("class_id=?", class.ID).Count(&count).Error; err != nil {
+				return err
+			}
+			if class.MaxStudents > 0 && count >= int64(class.MaxStudents) {
+				return errClassCapacityExceeded
+			}
+		}
+		if code == "" {
+			identity, err := nextStudentIdentity(tx, req.FullName, enrollmentDate.Year(), system, major)
+			if err != nil {
+				return err
+			}
+			code = identity.StudentCode
+		}
+		if req.AutoIdentity {
+			if err := tx.Model(&models.User{}).Where("username=? OR email=?", user.Username, user.Email).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				return errStudentCodeTaken
+			}
+		}
+		if err := tx.Model(&models.Student{}).Where("student_code=?", code).Count(&count).Error; err != nil {
 			return err
 		}
-		student.StudentCode = studentCode
+		if count > 0 {
+			return errStudentCodeTaken
+		}
+		student.StudentCode = code
 		if err := tx.Create(&user).Error; err != nil {
 			return err
 		}
@@ -190,8 +284,23 @@ func CreateStudent(c *gin.Context) {
 		if err := tx.Create(&student).Error; err != nil {
 			return err
 		}
+		if student.ClassID == 0 {
+			return nil
+		}
 		return syncStudentClassEnrollments(tx, student.ID, student.ClassID)
 	}); err != nil {
+		if errors.Is(err, errStudentCodeTaken) {
+			c.JSON(409, gin.H{"message": "Mã hoặc tên đăng nhập đã được sử dụng. Vui lòng bấm Cập nhật mã để lấy số tiếp theo."})
+			return
+		}
+		if errors.Is(err, errStudentMajorMismatch) {
+			c.JSON(400, gin.H{"message": "Lớp không thuộc chuyên ngành sinh viên đăng ký"})
+			return
+		}
+		if errors.Is(err, errClassCapacityExceeded) {
+			c.JSON(400, gin.H{"message": "Lớp đã đủ sĩ số tối đa. Vui lòng chọn lớp khác cùng chuyên ngành."})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Tạo sinh viên thất bại. Username/email/mã sinh viên có thể đã tồn tại", "error": err.Error()})
 		return
 	}
@@ -202,7 +311,15 @@ func CreateStudent(c *gin.Context) {
 
 func ListStudents(c *gin.Context) {
 	var students []models.Student
-	query := config.DB.Preload("User").Preload("Class")
+	query := config.DB.Preload("User").Preload("Class.Major").Preload("Major")
+	if majorID := strings.TrimSpace(c.Query("majorId")); majorID != "" {
+		id, err := strconv.ParseUint(majorID, 10, 32)
+		if err != nil || id == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "Chuyên ngành không hợp lệ"})
+			return
+		}
+		query = query.Where("students.major_id=? OR ((students.major_id IS NULL OR students.major_id=0) AND students.class_id IN (SELECT id FROM classes WHERE major_id=?))", id, id)
+	}
 	if classID := strings.TrimSpace(c.Query("classId")); classID != "" {
 		id, err := strconv.ParseUint(classID, 10, 64)
 		if err != nil || id == 0 {
@@ -295,28 +412,23 @@ func parseOptionalDate(value string) (time.Time, error) {
 	}
 	return date, nil
 }
-func generateNextStudentCode(db *gorm.DB) (string, error) {
-	var maximumNumber int
 
-	err := db.Raw(`
-		SELECT COALESCE(
-			MAX(
-				CAST(
-					SUBSTRING(student_code, 4)
-					AS UNSIGNED
-				)
-			),
-			0
-		)
-		FROM students
-		WHERE student_code REGEXP '^STD[0-9]+$'
-	`).Scan(&maximumNumber).Error
+var studentCodePattern = regexp.MustCompile(`^[A-Z0-9]{3,32}$`)
+var errStudentCodeTaken = errors.New("student code already used")
 
-	if err != nil {
-		return "", err
+func normalizeStudentGender(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return "", nil
+	case "nam", "male", "m":
+		return "Nam", nil
+	case "nu", "female", "f":
+		return "N\u1eef", nil
 	}
-
-	return fmt.Sprintf("STD%03d", maximumNumber+1), nil
+	if strings.EqualFold(strings.TrimSpace(value), "N\u1eef") {
+		return "N\u1eef", nil
+	}
+	return "", errors.New("Giới tính chỉ được chọn Nam hoặc Nữ")
 }
 
 // Existing codes stay unchanged. New codes use cryptographic randomness and the database unique constraint.

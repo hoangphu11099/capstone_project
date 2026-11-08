@@ -8,6 +8,7 @@ import (
 	"student-management/config"
 	"student-management/controllers"
 	"student-management/middleware"
+	"student-management/utils"
 
 	// "student-management/seed"
 
@@ -20,6 +21,9 @@ func main() {
 		log.Println("Warning: .env file not found, using system environment variables")
 	}
 
+	if err := utils.InitJWT(); err != nil {
+		log.Fatal(err)
+	}
 	config.ConnectDB()
 	config.AutoMigrateDB()
 
@@ -27,6 +31,16 @@ func main() {
 	// seed.SeedData()
 
 	r := gin.Default()
+	// Do not trust arbitrary forwarded IP headers for login rate limiting.
+	var trustedProxies []string
+	if configured := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES")); configured != "" {
+		for _, proxy := range strings.Split(configured, ",") {
+			trustedProxies = append(trustedProxies, strings.TrimSpace(proxy))
+		}
+	}
+	if err := r.SetTrustedProxies(trustedProxies); err != nil {
+		log.Fatal(err)
+	}
 	// ===== CORS =====
 	// Có thể cấu hình nhiều origin bằng CORS_ORIGINS, phân tách bằng dấu phẩy.
 	r.Use(func(c *gin.Context) {
@@ -63,7 +77,7 @@ func main() {
 		c.Next()
 	})
 	//U-1: Login
-	r.POST("/login", controllers.Login)
+	r.POST("/login", middleware.LoginRateLimit(), controllers.Login)
 	//U-3: Forgot Password
 	r.POST("/forgot-password", controllers.ForgotPassword)
 
@@ -114,6 +128,7 @@ func main() {
 		// U-09: Assign Teacher
 		auth.PUT("/classes/:id/assign-teacher", middleware.RoleRequired("admin"), controllers.AssignTeacher)
 		auth.POST("/classes/:id/course-offerings", middleware.RoleRequired("admin"), controllers.AssignCourseOffering)
+		auth.PUT("/classes/:id/schedules/:scheduleId", middleware.RoleRequired("admin"), controllers.RescheduleLesson)
 
 		// U-10: Send Notification To Email
 		auth.POST("/notifications/email", middleware.RoleRequired("admin"), controllers.SendNotificationToEmail)
@@ -141,6 +156,11 @@ func main() {
 		auth.POST("/class-offers", middleware.RoleRequired("admin"), controllers.CreateClassOffer)
 		// U-12: View Suggest Class
 		auth.GET("/class-offers", middleware.RoleRequired("teacher"), controllers.ViewSuggestClass)
+		auth.GET("/teacher/class-offers", middleware.RoleRequired("teacher"), controllers.ListMyClassOffers)
+		auth.PUT("/class-offers/:id/read", middleware.RoleRequired("teacher"), controllers.ReadClassOffer)
+		auth.PUT("/class-offers/read-all", middleware.RoleRequired("teacher"), controllers.ReadAllClassOffers)
+		auth.DELETE("/class-offers/read", middleware.RoleRequired("teacher"), controllers.DeleteReadClassOffers)
+		auth.DELETE("/class-offers/:id", middleware.RoleRequired("teacher"), controllers.DeleteReadClassOffer)
 		// U-13: Accept Class Offer
 		auth.POST("/class-offers/:id/accept", middleware.RoleRequired("teacher"), controllers.AcceptClassOffer)
 		// U-13: Reject Class Offer
@@ -154,6 +174,7 @@ func main() {
 		auth.GET("/classes/:id/learning-detail", middleware.RoleRequired("admin"), controllers.AdminClassLearningDetail)
 		auth.GET("/teacher/classes/:id/learning-detail", middleware.RoleRequired("teacher"), controllers.TeacherClassLearningDetail)
 		auth.GET("/students", middleware.RoleRequired("admin"), controllers.ListStudents)
+		auth.GET("/students/generate-code", middleware.RoleRequired("admin"), controllers.GenerateStudentCode)
 		auth.POST("/students", middleware.RoleRequired("admin"), controllers.CreateStudent)
 		auth.PUT("/students/:id", middleware.RoleRequired("admin"), controllers.UpdateStudent)
 		auth.DELETE("/students/:id", middleware.RoleRequired("admin"), controllers.DeleteStudent)

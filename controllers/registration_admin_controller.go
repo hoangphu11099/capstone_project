@@ -70,6 +70,20 @@ func registrationID(c *gin.Context) (uint, bool) {
 func ListAdminCourseRegistrations(c *gin.Context) {
 	var rows []models.CourseRegistration
 	query := config.DB.Preload("Enrollment.CourseOffering.Semester").Preload("Enrollment.CourseOffering.Teacher.User").Preload("Enrollment.CourseOffering.Room").Preload("Enrollment.CourseOffering.Schedules").Preload("Student.User").Preload("Course").Preload("Class").Preload("CourseOffering.Semester").Preload("CourseOffering.Teacher.User").Preload("CourseOffering.Room").Preload("CourseOffering.Schedules")
+	for _, filter := range []struct{ key, column string }{{"classId", "class_id"}, {"id", "id"}} {
+		if raw := c.Query(filter.key); raw != "" {
+			id, err := strconv.ParseUint(raw, 10, 32)
+			if err != nil || id == 0 {
+				c.JSON(400, gin.H{"message": "Invalid registration filter"})
+				return
+			}
+			query = query.Where(filter.column+" = ?", id)
+		}
+	}
+	if c.Query("summary") == "true" {
+		delete(query.Statement.Preloads, "Enrollment.CourseOffering.Schedules")
+		delete(query.Statement.Preloads, "CourseOffering.Schedules")
+	}
 	if status := c.Query("status"); status != "" {
 		query = query.Where("status = ?", status)
 	}

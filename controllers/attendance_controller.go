@@ -294,6 +294,14 @@ func CreateAttendanceSession(c *gin.Context) {
 	}
 
 	if err := config.DB.Transaction(func(tx *gorm.DB) error {
+		// Coordinate with admin rescheduling so a session cannot use a stale lesson.
+		var currentSchedule models.Schedule
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&currentSchedule, scheduleID).Error; err != nil {
+			return err
+		}
+		if !scheduleMatchesDate(currentSchedule, now) || normalizeClock(currentSchedule.StartTime) != normalizeClock(schedule.StartTime) || normalizeClock(currentSchedule.EndTime) != normalizeClock(schedule.EndTime) {
+			return errors.New("Lịch học vừa được thay đổi. Vui lòng tải lại lịch trước khi mở điểm danh")
+		}
 		var existing int64
 		if err := tx.Model(&models.AttendanceSession{}).Where("course_offering_id = ? AND DATE(class_date) = DATE(?) AND status <> ?", offering.ID, dayStart, "cancelled").Count(&existing).Error; err != nil {
 			return err

@@ -19,18 +19,20 @@ import (
 )
 
 type CreateClassOfferRequest struct {
-	ClassID       uint     `json:"classId" binding:"required"`
-	TeacherID     uint     `json:"teacherId" binding:"required"`
-	Title         string   `json:"title"`
-	Content       string   `json:"content"`
-	Message       string   `json:"message"`
-	SemesterID    uint     `json:"semesterId" binding:"required"`
-	CourseID      uint     `json:"courseId" binding:"required"`
-	RoomID        uint     `json:"roomId" binding:"required"`
-	TeachingDates []string `json:"teachingDates" binding:"required"`
-	Session       string   `json:"session"`
-	StartTime     string   `json:"startTime" binding:"required"`
-	EndTime       string   `json:"endTime" binding:"required"`
+	ClassID         uint     `json:"classId" binding:"required"`
+	TeacherID       uint     `json:"teacherId" binding:"required"`
+	Title           string   `json:"title"`
+	Content         string   `json:"content"`
+	Message         string   `json:"message"`
+	SemesterID      uint     `json:"semesterId" binding:"required"`
+	CourseID        uint     `json:"courseId" binding:"required"`
+	RoomID          uint     `json:"roomId" binding:"required"`
+	TeachingDates   []string `json:"teachingDates" binding:"required"`
+	Session         string   `json:"session"`
+	StartTime       string   `json:"startTime" binding:"required"`
+	EndTime         string   `json:"endTime" binding:"required"`
+	UrgentException bool     `json:"urgentException"`
+	ExceptionReason string   `json:"exceptionReason"`
 }
 type ClassOfferResponseRequest struct {
 	Note string `json:"note"`
@@ -38,9 +40,43 @@ type ClassOfferResponseRequest struct {
 
 // The plan records exactly what the teacher is agreeing to.
 type teachingOfferPlan struct {
-	Assignment  AssignCourseOfferingRequest `json:"assignment"`
-	Schedules   []models.Schedule           `json:"schedules"`
-	BaseVersion string                      `json:"baseVersion"`
+	Assignment      AssignCourseOfferingRequest `json:"assignment"`
+	Schedules       []models.Schedule           `json:"schedules"`
+	BaseVersion     string                      `json:"baseVersion"`
+	UrgentException bool                        `json:"urgentException,omitempty"`
+	ExceptionReason string                      `json:"exceptionReason,omitempty"`
+}
+
+func validateOfferFutureStarts(schedules []models.Schedule, now time.Time) error {
+	for _, schedule := range schedules {
+		if schedule.FullDate == nil {
+			return errors.New("Lịch đề xuất phải có ngày dạy cụ thể")
+		}
+		start, err := time.ParseInLocation("2006-01-02 15:04", schedule.FullDate.Format("2006-01-02")+" "+schedule.StartTime, attendanceLocation())
+		if err != nil || !start.After(now) {
+			return errors.New("Không được phân công lịch dạy trong quá khứ hoặc đã đến giờ bắt đầu, kể cả khi tạo ngoại lệ")
+		}
+	}
+	return nil
+}
+
+func validateOfferPreparation(schedules []models.Schedule, now time.Time, urgent bool, reason string) error {
+	if err := validateOfferFutureStarts(schedules, now); err != nil {
+		return err
+	}
+	if urgent {
+		if strings.TrimSpace(reason) == "" || len([]rune(strings.TrimSpace(reason))) > 1000 {
+			return errors.New("Vui lòng nhập lý do cấp bách để tạo ngoại lệ (tối đa 1000 ký tự)")
+		}
+		return nil
+	}
+	minimum := now.In(attendanceLocation()).AddDate(0, 0, 7).Format("2006-01-02")
+	for _, schedule := range schedules {
+		if schedule.FullDate.Format("2006-01-02") < minimum {
+			return errors.New("Ngày dạy phải cách ngày gửi phân công ít nhất 7 ngày để giảng viên chuẩn bị. Trường hợp cấp bách, hãy tạo ngoại lệ và ghi rõ lý do")
+		}
+	}
+	return nil
 }
 
 func offeringVersion(tx *gorm.DB, classID, courseID, semesterID uint) (string, []models.Schedule, error) {
@@ -109,9 +145,10 @@ func CreateClassOffer(c *gin.Context) {
 		return
 	}
 	assignment := AssignCourseOfferingRequest{CourseID: req.CourseID, SemesterID: req.SemesterID, TeacherID: req.TeacherID, RoomID: req.RoomID, TeachingDates: req.TeachingDates, Session: req.Session, StartTime: req.StartTime, EndTime: req.EndTime}
+	offeredAt := attendanceNow()
 	candidates, err := assignmentSchedules(assignment)
 	if err == nil {
-		err = validateFutureTeachingDates(candidates, attendanceNow())
+		err = validateOfferPreparation(candidates, offeredAt, req.UrgentException, req.ExceptionReason)
 	}
 	if err != nil {
 		c.JSON(400, gin.H{"message": err.Error()})
@@ -140,7 +177,7 @@ func CreateClassOffer(c *gin.Context) {
 				return errors.New("Học phần đang có lịch lặp theo tuần; hãy chuyển sang lịch ngày cụ thể trước khi gửi đề xuất")
 			}
 		}
-		plan, err := json.Marshal(teachingOfferPlan{Assignment: assignment, Schedules: schedules, BaseVersion: version})
+		plan, err := json.Marshal(teachingOfferPlan{Assignment: assignment, Schedules: schedules, BaseVersion: version, UrgentException: req.UrgentException, ExceptionReason: strings.TrimSpace(req.ExceptionReason)})
 		if err != nil {
 			return err
 		}
@@ -151,7 +188,7 @@ func CreateClassOffer(c *gin.Context) {
 		if content == "" {
 			content = strings.TrimSpace(req.Message)
 		}
-		offer = models.ClassOffer{ClassID: req.ClassID, TeacherID: req.TeacherID, CourseID: &req.CourseID, SemesterID: &req.SemesterID, RoomID: &req.RoomID, PlanJSON: string(plan), OfferedByUserID: adminID, Status: "pending", Title: title, Content: content, Message: content, OfferedAt: time.Now()}
+		offer = models.ClassOffer{ClassID: req.ClassID, TeacherID: req.TeacherID, CourseID: &req.CourseID, SemesterID: &req.SemesterID, RoomID: &req.RoomID, PlanJSON: string(plan), OfferedByUserID: adminID, Status: "pending", Title: title, Content: content, Message: content, OfferedAt: offeredAt}
 		return tx.Create(&offer).Error
 	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -162,13 +199,21 @@ func CreateClassOffer(c *gin.Context) {
 }
 
 func ViewSuggestClass(c *gin.Context) {
+	listClassOffers(c, false)
+}
+
+func ListMyClassOffers(c *gin.Context) {
+	listClassOffers(c, true)
+}
+
+func listClassOffers(c *gin.Context, teacherOnly bool) {
 	query := config.DB.Preload("Class.Major").Preload("Class.Room").Preload("Class.Semester").Preload("Teacher.User").Preload("OfferedByUser").Preload("Course").Preload("Semester").Preload("Room").Order("created_at desc, id desc")
-	if c.GetString("role") == "teacher" {
+	if teacherOnly || c.GetString("role") != "admin" {
 		teacher, ok := getCurrentTeacher(c)
 		if !ok {
 			return
 		}
-		query = query.Where("teacher_id = ?", teacher.ID)
+		query = query.Where("teacher_id = ? AND teacher_deleted_at IS NULL", teacher.ID)
 	}
 	if status := strings.TrimSpace(c.Query("status")); status != "" {
 		query = query.Where("status = ?", status)
@@ -183,6 +228,70 @@ func ViewSuggestClass(c *gin.Context) {
 
 func AcceptClassOffer(c *gin.Context) { respondClassOffer(c, "accepted") }
 func RejectClassOffer(c *gin.Context) { respondClassOffer(c, "rejected") }
+
+func ReadAllClassOffers(c *gin.Context) {
+	teacher, ok := getCurrentTeacher(c)
+	if !ok {
+		return
+	}
+	result := config.DB.Model(&models.ClassOffer{}).Where("teacher_id = ? AND teacher_deleted_at IS NULL AND read_at IS NULL", teacher.ID).Update("read_at", time.Now())
+	if result.Error != nil {
+		c.JSON(500, gin.H{"message": "Không đánh dấu được thư"})
+		return
+	}
+	c.JSON(200, gin.H{"message": "Đã đánh dấu tất cả thư đã đọc"})
+}
+
+func DeleteReadClassOffers(c *gin.Context) { deleteTeacherMail(c, false) }
+func DeleteReadClassOffer(c *gin.Context)  { deleteTeacherMail(c, true) }
+func deleteTeacherMail(c *gin.Context, single bool) {
+	teacher, ok := getCurrentTeacher(c)
+	if !ok {
+		return
+	}
+	query := config.DB.Model(&models.ClassOffer{}).Where("teacher_id = ? AND read_at IS NOT NULL AND teacher_deleted_at IS NULL", teacher.ID)
+	if single {
+		id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+		if err != nil || id == 0 {
+			c.JSON(400, gin.H{"message": "ID thư không hợp lệ"})
+			return
+		}
+		query = query.Where("id = ?", id)
+	}
+	result := query.Update("teacher_deleted_at", time.Now())
+	if result.Error != nil {
+		c.JSON(500, gin.H{"message": "Không xóa được thư"})
+		return
+	}
+	if single && result.RowsAffected == 0 {
+		c.JSON(400, gin.H{"message": "Chỉ được xóa thư đã đọc trong hộp thư của bạn"})
+		return
+	}
+	c.JSON(200, gin.H{"message": "Đã xóa thư khỏi hộp thư"})
+}
+
+func ReadClassOffer(c *gin.Context) {
+	teacher, ok := getCurrentTeacher(c)
+	if !ok {
+		return
+	}
+	id, err := strconv.ParseUint(c.Param("id"), 10, 32)
+	if err != nil || id == 0 {
+		c.JSON(400, gin.H{"message": "ID thư mời không hợp lệ"})
+		return
+	}
+	var offer models.ClassOffer
+	if err := config.DB.Where("id = ? AND teacher_id = ?", id, teacher.ID).First(&offer).Error; err != nil {
+		c.JSON(404, gin.H{"message": "Không tìm thấy thư mời"})
+		return
+	}
+	if err := config.DB.Model(&models.ClassOffer{}).Where("id = ? AND teacher_id = ? AND read_at IS NULL", id, teacher.ID).Update("read_at", time.Now()).Error; err != nil {
+		c.JSON(500, gin.H{"message": "Không cập nhật được trạng thái đọc"})
+		return
+	}
+	config.DB.First(&offer, id)
+	c.JSON(200, gin.H{"data": gin.H{"ID": offer.ID, "ReadAt": offer.ReadAt}})
+}
 
 func respondClassOffer(c *gin.Context, status string) {
 	teacher, ok := getCurrentTeacher(c)
@@ -229,7 +338,7 @@ func respondClassOffer(c *gin.Context, status string) {
 			if err != nil {
 				return err
 			}
-			if err := validateFutureTeachingDates(candidates, attendanceNow()); err != nil {
+			if err := validateOfferFutureStarts(candidates, attendanceNow()); err != nil {
 				return err
 			}
 			plan.Assignment.TeacherID = teacher.ID

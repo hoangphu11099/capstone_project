@@ -23,13 +23,15 @@ type ClassOffer struct {
 	OfferedByUserID uint
 	OfferedByUser   User `gorm:"foreignKey:OfferedByUserID"`
 
-	Status       string `gorm:"default:pending"`
-	Title        string `gorm:"size:255"`
-	Content      string `gorm:"type:text"`
-	Message      string `gorm:"type:text"`
-	ResponseNote string `gorm:"type:text"`
-	OfferedAt    time.Time
-	RespondedAt  *time.Time
+	Status           string `gorm:"default:pending"`
+	Title            string `gorm:"size:255"`
+	Content          string `gorm:"type:text"`
+	Message          string `gorm:"type:text"`
+	ResponseNote     string `gorm:"type:text"`
+	OfferedAt        time.Time
+	RespondedAt      *time.Time
+	ReadAt           *time.Time
+	TeacherDeletedAt *time.Time
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

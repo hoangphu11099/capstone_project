@@ -13,4 +13,6 @@ type Schedule struct {
 	Session          string
 	StartTime        string
 	EndTime          string
+	OriginalDate     *time.Time `gorm:"type:date"`
+	RescheduleReason string     `gorm:"type:text"`
 }
