@@ -199,7 +199,7 @@ func CreateStudent(c *gin.Context) {
 		}
 	}
 	var major models.Major
-	if err := config.DB.First(&major, req.MajorID).Error; err != nil {
+	if err := config.DB.Where("is_active = ?", true).First(&major, req.MajorID).Error; err != nil {
 		c.JSON(400, gin.H{"message": "Không tìm thấy chuyên ngành đăng ký"})
 		return
 	}

@@ -12,6 +12,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+	"mime/multipart"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -314,9 +315,64 @@ func TestAcademicFlowIntegration(t *testing.T) {
 		t.Fatal("transcript uses wrong semester")
 	}
 	call(CreateExercise, tu.ID, "", ExerciseRequest{CourseOfferingID: offering.ID, Title: "Unauthorized", DueDate: day(now.AddDate(0, 0, 1))}, 403)
+	// A future concrete lesson must permit assignment preparation even when
+	// semester metadata says closed. Exercise creation still checks ownership.
+	futureLessonDate := now.AddDate(2, 0, 0)
+	futureLesson := models.Schedule{ClassID: offering.ClassID, CourseOfferingID: &offering.ID, FullDate: &futureLessonDate, StartTime: "13:30", EndTime: "16:30"}
+	create(&futureLesson)
+	db.Model(&models.Semester{}).Where("id = ?", term.ID).Update("status", "closed")
+	prepared := call(CreateExercise, tu2.ID, "", ExerciseRequest{CourseOfferingID: offering.ID, Title: "Prepare future lesson", DueDate: day(now.AddDate(0, 0, 2))}, 201)
+	var preparedExercise models.Exercise
+	json.Unmarshal(prepared["data"], &preparedExercise)
+	db.Delete(&preparedExercise)
+	db.Model(&models.Semester{}).Where("id = ?", term.ID).Update("status", term.Status)
+	db.Delete(&futureLesson)
 	payload = call(CreateExercise, tu2.ID, "", ExerciseRequest{CourseOfferingID: offering.ID, Title: "Term exercise", DueDate: day(now.AddDate(0, 0, 1))}, 201)
 	var exercise models.Exercise
 	json.Unmarshal(payload["data"], &exercise)
+	// Two-file quiz workflow: only the assigned teacher can supply/read keys.
+	qp := call(CreateQuiz, tu2.ID, "", map[string]any{"title": "Quiz integration", "courseOfferingId": offering.ID, "dueDate": now.Add(48 * time.Hour).Format(time.RFC3339)}, 201)
+	var quiz models.Quiz
+	json.Unmarshal(qp["data"], &quiz)
+	quizID := fmt.Sprint(quiz.ID)
+	call(PublishQuiz, tu2.ID, quizID, nil, 400)
+	quizUpload := func(uid uint, kind string, rows [][]interface{}, want int) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, _ := writer.CreateFormFile("file", "quiz.xlsx")
+		part.Write(quizWorkbook(t, rows))
+		writer.Close()
+		call(func(c *gin.Context) {
+			c.Params = append(c.Params, gin.Param{Key: "kind", Value: kind})
+			c.Request = httptest.NewRequest("POST", "/", bytes.NewReader(body.Bytes()))
+			c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			ImportQuizExcel(c)
+		}, uid, quizID, nil, want)
+	}
+	quizUpload(tu2.ID, "questions", [][]interface{}{{"STT", "CauHoi", "A", "B", "C", "D"}, {1, "Question 1", "a", "b", "c", "d"}, {2, "Question 2", "a", "b", "c", "d"}}, 200)
+	quizUpload(adminUser.ID, "answers", [][]interface{}{{"STT", "DapAn"}, {1, "C"}, {2, "A"}}, 403)
+	quizUpload(tu.ID, "answers", [][]interface{}{{"STT", "DapAn"}, {1, "C"}, {2, "A"}}, 403)
+	quizUpload(tu2.ID, "answers", [][]interface{}{{"STT", "DapAn"}, {1, "C"}, {3, "A"}}, 400)
+	quizUpload(tu2.ID, "answers", [][]interface{}{{"STT", "DapAn"}, {1, "C"}, {2, "A"}}, 200)
+	call(QuizAnswerKey, adminUser.ID, quizID, nil, 403)
+	call(QuizAnswerKey, su.ID, quizID, nil, 403)
+	call(QuizAnswerKey, tu2.ID, quizID, nil, 200)
+	call(PublishQuiz, tu2.ID, quizID, nil, 200)
+	studentQuiz := call(QuizDetail, su.ID, quizID, nil, 200)
+	if bytes.Contains(studentQuiz["questions"], []byte("Answer")) {
+		t.Fatal("student received answer key")
+	}
+	quizUpload(tu2.ID, "questions", [][]interface{}{{"STT", "CauHoi", "A", "B", "C", "D"}, {1, "Replacement", "a", "b", "c", "d"}}, 400)
+	gradedQuiz := call(SubmitQuiz, su.ID, quizID, map[string]any{"answers": map[int]string{1: "C", 2: "B"}, "score": 100}, 200)
+	var quizScore float64
+	json.Unmarshal(gradedQuiz["score"], &quizScore)
+	if quizScore != 50 {
+		t.Fatal("server trusted client score")
+	}
+	call(SubmitQuiz, su.ID, quizID, map[string]any{"answers": map[int]string{1: "C", 2: "A"}}, 400)
+	call(QuizResults, su.ID, quizID, nil, 403)
+	call(QuizResults, tu2.ID, quizID, nil, 200)
 	payload = call(SubmitExercise, su.ID, fmt.Sprint(exercise.ID), SubmissionRequest{Content: "My answer"}, 200)
 	var submission models.Submission
 	json.Unmarshal(payload["data"], &submission)
@@ -361,6 +417,8 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	su2 := user("student2", studentRole.ID)
 	student2 := models.Student{UserID: su2.ID, StudentCode: "S2", ClassID: class.ID, DateOfBirth: now.AddDate(-20, 0, 0), EnrollmentDate: now}
 	create(&student2)
+	call(QuizDetail, su2.ID, quizID, nil, 403)
+	call(SubmitQuiz, su2.ID, quizID, map[string]any{"answers": map[int]string{1:"C"}}, 403)
 	call(SubmitExercise, su2.ID, fmt.Sprint(exercise.ID), SubmissionRequest{Content: "Not enrolled"}, 403)
 	call(RegisterCourse, su2.ID, "", RegisterCourseRequest{CourseOfferingID: oldOffering.ID}, 201)
 	call(RegisterCourse, su2.ID, "", RegisterCourseRequest{CourseOfferingID: offering.ID}, 201)
@@ -591,6 +649,47 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	if examNotifications == 0 {
 		t.Fatal("student did not receive exam notification")
 	}
+	// Duplicate deliveries collapse for students; admins also group recipients.
+	for _, recipient := range []uint{su.ID, su.ID, tu2.ID} {
+		id := recipient
+		if err := db.Create(&models.Notification{RecipientUserID: &id, RecipientClassCode: "SENT_CLASS_SNAPSHOT", Subject: "Grouping regression", Content: "Same message", TargetType: "user", Channel: "app", Status: "created"}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, role := range []string{"student", "admin"} {
+		response := call(func(c *gin.Context) {
+			c.Set("role", role)
+			ListNotifications(c)
+		}, su.ID, "", nil, 200)
+		var notices []struct {
+			models.Notification
+			RecipientCount   int64
+			RecipientClasses string
+		}
+		if err := json.Unmarshal(response["data"], &notices); err != nil {
+			t.Fatal(err)
+		}
+		matches := 0
+		for _, notice := range notices {
+			if notice.Subject != "Grouping regression" {
+				continue
+			}
+			matches++
+			wantCount := int64(1)
+			if role == "admin" {
+				wantCount = 2
+			}
+			if notice.RecipientCount != wantCount || notice.RecipientUser == nil {
+				t.Fatalf("%s: incorrect recipient count or missing recipient: %+v", role, notice)
+			}
+			if notice.RecipientClasses != "SENT_CLASS_SNAPSHOT" {
+				t.Fatalf("%s: class must reflect the sent notification, got %q", role, notice.RecipientClasses)
+			}
+		}
+		if matches != 1 {
+			t.Fatalf("%s: expected one grouped message, got %d", role, matches)
+		}
+	}
 
 	payload = call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{MajorID: major.ID, Username: "created-teacher", FullName: "Created Teacher", Email: "created-teacher@example.test"}, 201)
 	var generated models.Teacher
@@ -663,8 +762,62 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	newMajorPayload := call(CreateMajor, adminUser.ID, "", map[string]string{"code": "BIZ", "name": "Business administration"}, 201)
 	var teacherMajor models.Major
 	json.Unmarshal(newMajorPayload["data"], &teacherMajor)
+	// One catalog feeds every form; stopping training removes new admission choices.
+	assertMajorAvailable := func(want bool) {
+		t.Helper()
+		response := call(GetMetadata, adminUser.ID, "", nil, 200)
+		var data struct {
+			Majors []models.Major `json:"majors"`
+		}
+		if err := json.Unmarshal(response["data"], &data); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, item := range data.Majors {
+			if item.ID == teacherMajor.ID {
+				found = true
+			}
+		}
+		if found != want {
+			t.Fatalf("shared catalog availability: want %v got %v", want, found)
+		}
+	}
+	assertMajorAvailable(true)
+	call(UpdateMajor, adminUser.ID, fmt.Sprint(teacherMajor.ID), map[string]any{"code": "OTHER", "name": "Business"}, 400)
+	call(UpdateMajor, adminUser.ID, fmt.Sprint(teacherMajor.ID), map[string]any{"name": "Business", "isActive": false}, 200)
+	assertMajorAvailable(false)
+	catalog := call(ListMajors, adminUser.ID, "", nil, 200)
+	var allMajors []models.Major
+	json.Unmarshal(catalog["data"], &allMajors)
+	archived := false
+	for _, item := range allMajors {
+		if item.ID == teacherMajor.ID && !item.IsActive {
+			archived = true
+		}
+	}
+	if !archived {
+		t.Fatal("inactive major missing from management catalog")
+	}
+	call(CreateStudent, adminUser.ID, "", CreateStudentRequest{Username: "inactive-major-student", FullName: "Inactive major", MajorID: teacherMajor.ID}, 400)
+	call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{Username: "inactive-major-teacher", FullName: "Inactive major", MajorID: teacherMajor.ID}, 400)
+	call(CreateCourse, adminUser.ID, "", CourseRequest{Code: "INACTIVE_MAJOR", Name: "Inactive major", Credits: 3, MajorID: teacherMajor.ID}, 400)
+	call(UpdateMajor, adminUser.ID, fmt.Sprint(teacherMajor.ID), map[string]any{"name": teacherMajor.Name, "isActive": true}, 200)
+	assertMajorAvailable(true)
 	call(CreateMajor, adminUser.ID, "", map[string]string{"code": "biz", "name": "Duplicate"}, 400)
-	call(CreateMajor, adminUser.ID, "", map[string]string{"code": "", "name": "Missing code"}, 400)
+	var autoMajor, collisionMajor models.Major
+	firstAuto := call(CreateMajor, adminUser.ID, "", map[string]string{"name": "Quản trị kinh doanh"}, 201)
+	json.Unmarshal(firstAuto["data"], &autoMajor)
+	secondAuto := call(CreateMajor, adminUser.ID, "", map[string]string{"name": "Quản trị kinh doanh"}, 201)
+	json.Unmarshal(secondAuto["data"], &collisionMajor)
+	if autoMajor.Code != "QTKD" || !strings.HasPrefix(collisionMajor.Code, "QTKD") || collisionMajor.Code == autoMajor.Code {
+		t.Fatalf("automatic major codes not unique abbreviations: %s / %s", autoMajor.Code, collisionMajor.Code)
+	}
+	for _, letter := range collisionMajor.Code {
+		if letter < 'A' || letter > 'Z' {
+			t.Fatal("generated major code must use uppercase letters")
+		}
+	}
+	call(CreateMajor, adminUser.ID, "", map[string]string{"name": " "}, 400)
 	call(CreateTeacher, adminUser.ID, "", CreateTeacherRequest{Username: "no-major", FullName: "No major"}, 400)
 	db.First(&beforeTeacherUpdate, generated.UserID)
 	teacherUpdate := CreateTeacherRequest{MajorID: teacherMajor.ID, Username: "created-teacher", FullName: "Updated Teacher", Email: "created-teacher@example.test", Phone: "0123456789", Qualification: "Doctor", TeacherCode: "SHOULD_NOT_CHANGE"}
@@ -1057,6 +1210,29 @@ func TestAcademicFlowIntegration(t *testing.T) {
 	call(AssignCourseOffering, adminUser.ID, fmt.Sprint(class.ID), req, 400)
 	call(CreateAttendanceSession, tu2.ID, "", CreateAttendanceSessionRequest{CourseOfferingID: offering.ID}, 400)
 	t.Run("self profile and password", func(t *testing.T) {
+		t.Run("student class and registered major", func(t *testing.T) {
+			var expected models.Student
+			if err := db.Preload("Major").Preload("Class.Major").Where("user_id = ?", su.ID).First(&expected).Error; err != nil {
+				t.Fatal(err)
+			}
+			result := call(GetOwnProfile, su.ID, "", nil, 200)
+			var profile models.User
+			if err := json.Unmarshal(result["data"], &profile); err != nil {
+				t.Fatal(err)
+			}
+			if profile.Student == nil || profile.Student.StudentCode != expected.StudentCode || profile.Student.Class.ClassCode != expected.Class.ClassCode || profile.Student.Major.Name != expected.Major.Name || profile.Student.Major.Name == "" {
+				t.Fatal("student profile missing class or registered major")
+			}
+			unassignedUser := models.User{Username: "profile-unassigned", FullName: "Unassigned Student", Email: "profile-unassigned@example.test", RoleID: studentRole.ID}
+			create(&unassignedUser)
+			unassigned := models.Student{UserID: unassignedUser.ID, StudentCode: "PROFILEUNASSIGNED", MajorID: expected.MajorID, EnrollmentDate: now}
+			create(&unassigned)
+			result = call(GetOwnProfile, unassignedUser.ID, "", nil, 200)
+			json.Unmarshal(result["data"], &profile)
+			if profile.Student == nil || profile.Student.ClassID != 0 || profile.Student.Major.Name != expected.Major.Name {
+				t.Fatal("unassigned student must still see their registered major")
+			}
+		})
 		for _, uid := range []uint{adminUser.ID, tu.ID} {
 			profilePayload := call(GetOwnProfile, uid, "", nil, 200)
 			var profile models.User

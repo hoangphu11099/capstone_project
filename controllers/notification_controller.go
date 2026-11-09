@@ -32,9 +32,10 @@ type SendNotificationRequest struct {
 }
 
 type notificationRecipient struct {
-	UserID   *uint
-	Email    string
-	FullName string
+	UserID    *uint
+	Email     string
+	FullName  string
+	ClassCode string
 }
 
 // SendNotificationToEmail hỗ trợ cả thông báo trong app và email. Endpoint cũ
@@ -106,15 +107,16 @@ func SendNotificationToEmail(c *gin.Context) {
 		}
 
 		notification := models.Notification{
-			RecipientUserID: recipient.UserID,
-			RecipientEmail:  strings.TrimSpace(recipient.Email),
-			Subject:         req.Subject,
-			Content:         req.Content,
-			TargetType:      targetType,
-			Channel:         channel,
-			Status:          status,
-			SentAt:          sentAt,
-			CreatedByID:     &currentUserID,
+			RecipientUserID:    recipient.UserID,
+			RecipientEmail:     strings.TrimSpace(recipient.Email),
+			RecipientClassCode: recipient.ClassCode,
+			Subject:            req.Subject,
+			Content:            req.Content,
+			TargetType:         targetType,
+			Channel:            channel,
+			Status:             status,
+			SentAt:             sentAt,
+			CreatedByID:        &currentUserID,
 		}
 		if err := config.DB.Create(&notification).Error; err != nil {
 			failed++
@@ -205,6 +207,25 @@ func resolveNotificationRecipients(req SendNotificationRequest) ([]notificationR
 		return nil, targetType, fmt.Errorf("đối tượng nhận không hợp lệ")
 	}
 
+	var recipientClasses []struct {
+		UserID    uint
+		ClassCode string
+	}
+	userIDs := make([]uint, 0, len(users))
+	for _, user := range users {
+		userIDs = append(userIDs, user.ID)
+	}
+	if len(userIDs) > 0 {
+		if err := config.DB.Table("students").Select("students.user_id, classes.class_code").
+			Joins("JOIN classes ON classes.id = students.class_id").
+			Where("students.user_id IN ?", userIDs).Scan(&recipientClasses).Error; err != nil {
+			return nil, targetType, err
+		}
+	}
+	classCodes := make(map[uint]string)
+	for _, recipient := range recipientClasses {
+		classCodes[recipient.UserID] = recipient.ClassCode
+	}
 	result := make([]notificationRecipient, 0, len(users))
 	seen := make(map[uint]bool)
 	for _, user := range users {
@@ -213,7 +234,7 @@ func resolveNotificationRecipients(req SendNotificationRequest) ([]notificationR
 		}
 		seen[user.ID] = true
 		userID := user.ID
-		result = append(result, notificationRecipient{UserID: &userID, Email: user.Email, FullName: user.FullName})
+		result = append(result, notificationRecipient{UserID: &userID, Email: user.Email, FullName: user.FullName, ClassCode: classCodes[user.ID]})
 	}
 	return result, targetType, nil
 }
@@ -320,10 +341,27 @@ func ListNotifications(c *gin.Context) {
 	}
 
 	role := c.GetString("role")
-	var notifications []models.Notification
-	query := config.DB.Preload("RecipientUser").Order("created_at desc")
+	var notifications []struct {
+		models.Notification
+		RecipientCount   int64
+		RecipientClasses string
+	}
+	query := config.DB.Model(&models.Notification{}).Preload("RecipientUser").Order("notifications.created_at desc, notifications.id desc")
 	if role != "admin" {
-		query = query.Where("recipient_user_id = ?", userID)
+		query = query.Where("notifications.recipient_user_id = ?", userID)
+	}
+	// All clients show one entry per message. Delivery history remains opt-in.
+	if c.Query("summary") != "false" {
+		latest := config.DB.Model(&models.Notification{}).
+			Select("MAX(notifications.id) AS latest_id, COUNT(DISTINCT COALESCE(CAST(notifications.recipient_user_id AS CHAR), notifications.recipient_email)) AS recipient_count, GROUP_CONCAT(DISTINCT COALESCE(NULLIF(notifications.recipient_class_code, ''), classes.class_code) ORDER BY COALESCE(NULLIF(notifications.recipient_class_code, ''), classes.class_code) SEPARATOR ', ') AS recipient_classes").
+			Joins("LEFT JOIN students ON students.user_id = notifications.recipient_user_id").
+			Joins("LEFT JOIN classes ON classes.id = students.class_id").
+			Group("notifications.subject, notifications.content, notifications.target_type, notifications.channel, notifications.status, notifications.created_by_id")
+		if role != "admin" {
+			latest = latest.Where("notifications.recipient_user_id = ?", userID)
+		}
+		query = query.Select("notifications.*, message_groups.recipient_count, message_groups.recipient_classes").
+			Joins("JOIN (?) AS message_groups ON message_groups.latest_id = notifications.id", latest)
 	}
 	if err := query.Limit(500).Find(&notifications).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Lỗi lấy danh sách thông báo", "error": err.Error()})

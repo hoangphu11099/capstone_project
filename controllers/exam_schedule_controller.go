@@ -144,6 +144,11 @@ func UpdateExamSchedule(c *gin.Context) {
 		return
 	}
 
+	changed := exam.ClassID != req.ClassID || exam.CourseID != req.CourseID ||
+		exam.SemesterID != req.SemesterID || exam.RoomID != req.RoomID ||
+		!exam.ExamDate.Equal(examDate) || exam.Session != strings.TrimSpace(req.Session) ||
+		exam.StartTime != strings.TrimSpace(req.StartTime) || exam.EndTime != strings.TrimSpace(req.EndTime) ||
+		exam.ExamType != strings.TrimSpace(req.ExamType) || exam.Note != strings.TrimSpace(req.Note)
 	exam.ClassID = req.ClassID
 	exam.CourseID = req.CourseID
 	exam.SemesterID = req.SemesterID
@@ -158,6 +163,9 @@ func UpdateExamSchedule(c *gin.Context) {
 	if err := config.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&exam).Error; err != nil {
 			return err
+		}
+		if !changed {
+			return nil
 		}
 		return notifyExamClass(tx, exam)
 	}); err != nil {
@@ -267,7 +275,7 @@ func notifyExamClass(tx *gorm.DB, exam models.ExamSchedule) error {
 			continue
 		}
 		recipient := userID
-		notification := models.Notification{RecipientUserID: &recipient, Subject: "Lịch thi · " + offering.Course.Name, Content: fmt.Sprintf("Lớp %s · %s: thi ngày %s, ca %s (%s–%s), hình thức %s. %s", offering.Class.ClassCode, offering.Course.Name, exam.ExamDate.Format("02/01/2006"), exam.Session, exam.StartTime, exam.EndTime, exam.ExamType, exam.Note), TargetType: "user", Channel: "app", Status: "created"}
+		notification := models.Notification{RecipientUserID: &recipient, RecipientClassCode: offering.Class.ClassCode, Subject: "Lịch thi · " + offering.Course.Name, Content: fmt.Sprintf("Lớp %s · %s: thi ngày %s, ca %s (%s–%s), hình thức %s. %s", offering.Class.ClassCode, offering.Course.Name, exam.ExamDate.Format("02/01/2006"), exam.Session, exam.StartTime, exam.EndTime, exam.ExamType, exam.Note), TargetType: "user", Channel: "app", Status: "created"}
 		if err := tx.Create(&notification).Error; err != nil {
 			return err
 		}

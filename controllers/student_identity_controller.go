@@ -68,7 +68,7 @@ func GenerateStudentCode(c *gin.Context) {
 		return
 	}
 	var major models.Major
-	if err := config.DB.First(&major, majorID).Error; err != nil {
+	if err := config.DB.Where("is_active = ?", true).First(&major, majorID).Error; err != nil {
 		c.JSON(400, gin.H{"message": "Không tìm thấy chuyên ngành"})
 		return
 	}

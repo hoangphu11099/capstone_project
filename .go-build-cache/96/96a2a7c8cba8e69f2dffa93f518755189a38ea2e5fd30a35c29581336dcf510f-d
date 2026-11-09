@@ -1,0 +1,7 @@
+./credentials.go
+./jwt.go
+./major_code.go
+./student_identity.go
+./jwt_test.go
+./major_code_test.go
+./student_identity_test.go

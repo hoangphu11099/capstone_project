@@ -699,7 +699,7 @@ func (b *builder) schoolDataset(roles map[string]uint) {
 		teachers := []models.Teacher{}
 		for j := 0; j < 5; j++ {
 			n := m*5 + j + 1
-			u := b.user(fmt.Sprintf("teacher%02d", n), []string{"Nguyễn Minh Khang", "Trần Hoàng Anh", "Lê Thu Hà", "Phạm Quốc Bảo", "Võ Ngọc Linh"}[j], roles["teacher"], n == 4)
+			u := b.user(fmt.Sprintf("teacher%02d", n), DemoTeacherNames[n-1], roles["teacher"], n == 4)
 			t := models.Teacher{UserID: u.ID, TeacherCode: fmt.Sprintf("GV%03d", n), MajorID: major.ID, Phone: fmt.Sprintf("090100%04d", n), Address: "Thành phố Hồ Chí Minh", Qualification: "Thạc sĩ", HireDate: terms[0].StartDate.AddDate(-2, 0, 0)}
 			b.create(&t)
 			teachers = append(teachers, t)

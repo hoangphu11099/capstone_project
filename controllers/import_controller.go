@@ -509,6 +509,9 @@ func importOneStudent(item StudentImportItem, roleID uint) error {
 		if err := tx.Preload("Major").First(&targetClass, classID).Error; err != nil {
 			return err
 		}
+		if student.ID == 0 && (targetClass.MajorID == 0 || !targetClass.Major.IsActive) {
+			return errors.New("Chỉ tiếp nhận sinh viên vào chuyên ngành đang đào tạo")
+		}
 		if code := strings.TrimSpace(item.StudentCode); code != "" {
 			student.StudentCode = code
 		} else if student.ID == 0 {

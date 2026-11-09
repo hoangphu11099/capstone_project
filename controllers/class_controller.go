@@ -122,7 +122,7 @@ func CreateClass(c *gin.Context) {
 	}
 
 	var major models.Major
-	if err := config.DB.First(&major, req.MajorID).Error; err != nil {
+	if err := config.DB.Where("is_active = ?", true).First(&major, req.MajorID).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"message": "Không tìm thấy chuyên ngành"})
 		return
 	}

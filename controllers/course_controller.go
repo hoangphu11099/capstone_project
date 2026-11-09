@@ -78,6 +78,11 @@ func CreateCourse(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Số tín chỉ phải lớn hơn 0"})
 		return
 	}
+	var major models.Major
+	if config.DB.Where("is_active = ?", true).First(&major, req.MajorID).Error != nil {
+		c.JSON(400, gin.H{"message": "Vui lòng chọn chuyên ngành đang đào tạo"})
+		return
+	}
 
 	isActive := true
 	if req.IsActive != nil {
@@ -123,6 +128,13 @@ func UpdateCourse(c *gin.Context) {
 	if err := config.DB.First(&course, id).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"message": "Không tìm thấy môn học"})
 		return
+	}
+	if req.MajorID != course.MajorID {
+		var major models.Major
+		if config.DB.Where("is_active = ?", true).First(&major, req.MajorID).Error != nil {
+			c.JSON(400, gin.H{"message": "Vui lòng chọn chuyên ngành đang đào tạo"})
+			return
+		}
 	}
 
 	course.Code = strings.TrimSpace(req.Code)

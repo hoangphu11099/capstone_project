@@ -15,7 +15,7 @@ func GetOwnProfile(c *gin.Context) {
 		return
 	}
 	var user models.User
-	if err := config.DB.Preload("Role").Preload("Teacher.Major").Preload("Student.Class").First(&user, id).Error; err != nil {
+	if err := config.DB.Preload("Role").Preload("Teacher.Major").Preload("Student.Major").Preload("Student.Class.Major").First(&user, id).Error; err != nil {
 		c.JSON(404, gin.H{"message": "Không tìm thấy hồ sơ"})
 		return
 	}

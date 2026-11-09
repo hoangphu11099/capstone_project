@@ -52,12 +52,12 @@ func CreateExercise(c *gin.Context) {
 		c.JSON(400, gin.H{"message": "Vui lòng chọn học phần cho bài tập"})
 		return
 	}
-	if err := config.DB.Preload("Semester").Where("id = ? AND teacher_id = ? AND status = ?", req.CourseOfferingID, teacher.ID, "open").First(&offering).Error; err != nil {
+	if err := config.DB.Preload("Semester").Preload("Class").Preload("Schedules").Where("id = ? AND teacher_id = ? AND status = ?", req.CourseOfferingID, teacher.ID, "open").First(&offering).Error; err != nil {
 		c.JSON(403, gin.H{"message": "Không được phân công học phần này"})
 		return
 	}
-	if offering.Semester.Status == "closed" {
-		c.JSON(400, gin.H{"message": "Học kỳ đã đóng"})
+	if exerciseOfferingEnded(offering, attendanceNow()) {
+		c.JSON(400, gin.H{"message": "Lớp học phần đã kết thúc, không thể tạo bài tập mới"})
 		return
 	}
 	req.ClassID = offering.ClassID
